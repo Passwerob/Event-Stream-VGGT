@@ -80,3 +80,18 @@ logs/
 tmp/
 temp/
 *.tmp
+
+# Local checkpoints / outputs
+ckpt/
+src/output/
+
+# Web viewer deps/build (if applicable)
+src/web_viewer/node_modules/
+src/web_viewer/dist/
+src/web_viewer/build/
+
+# Misc
+*.mp4
+*.pth
+*.pt
+*.ckpt
