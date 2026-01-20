@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from streamvggt.models.aggregator import Aggregator
@@ -32,7 +33,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         super().__init__()
 
         self.extractor_type = extractor_type
-        agg_patch = "evencoder" if extractor_type == "evencoder" else patch_embed
+        if extractor_type in ("evencoder", "evencoder-v2"):
+            agg_patch = extractor_type
+        else:
+            agg_patch = patch_embed
         self.aggregator = Aggregator(
             img_size=img_size,
             patch_size=patch_size,
@@ -49,8 +53,6 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
     
-
-
     def forward(
         self,
         views,
@@ -74,6 +76,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             history_info = {"token": None}
 
         aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        images_for_heads = images  # Use images directly for heads
         predictions = {}
 
         with torch.cuda.amp.autocast(enabled=False):
@@ -83,26 +86,26 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
             if self.depth_head is not None:
                 depth, depth_conf = self.depth_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                    aggregated_tokens_list, images=images_for_heads, patch_start_idx=patch_start_idx
                 )
                 predictions["depth"] = depth
                 predictions["depth_conf"] = depth_conf
 
             if self.point_head is not None:
                 pts3d, pts3d_conf = self.point_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                    aggregated_tokens_list, images=images_for_heads, patch_start_idx=patch_start_idx
                 )
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
 
             if self.track_head is not None and query_points is not None:
                 track_list, vis, conf = self.track_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx, query_points=query_points
+                    aggregated_tokens_list, images=images_for_heads, patch_start_idx=patch_start_idx, query_points=query_points
                 )
                 predictions["track"] = track_list[-1]  # track of the last iteration
                 predictions["vis"] = vis
                 predictions["conf"] = conf
-            predictions["images"] = images
+            predictions["images"] = images_for_heads
 
             B, S = images.shape[:2]
             ress = []
@@ -147,6 +150,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             else:
                 aggregated_tokens, patch_start_idx = aggregator_output
             
+            # images is [B, C, H, W], use directly for heads
+            images_for_heads = images
+            
             with torch.cuda.amp.autocast(enabled=False):
                 if self.camera_head is not None:
                     pose_enc, past_key_values_camera = self.camera_head(aggregated_tokens, past_key_values_camera=past_key_values_camera, use_cache=True)
@@ -155,22 +161,22 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
                 if self.depth_head is not None:
                     depth, depth_conf = self.depth_head(
-                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx
+                        aggregated_tokens, images=images_for_heads, patch_start_idx=patch_start_idx
                     )
                     depth = depth[:, 0] 
                     depth_conf = depth_conf[:, 0]
                 
                 if self.point_head is not None:
                     pts3d, pts3d_conf = self.point_head(
-                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx
+                        aggregated_tokens, images=images_for_heads, patch_start_idx=patch_start_idx
                     )
                     pts3d = pts3d[:, 0] 
                     pts3d_conf = pts3d_conf[:, 0]
 
                 if self.track_head is not None and query_points is not None:
                     track_list, vis, conf = self.track_head(
-                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx, query_points=query_points
-                )
+                        aggregated_tokens, images=images_for_heads, patch_start_idx=patch_start_idx, query_points=query_points
+                    )
                     track = track_list[-1][:, 0]  
                     query_points = track
                     vis = vis[:, 0]

@@ -13,10 +13,9 @@ import time
 import json
 import threading
 
-from models.evencoder import EvEncoder
 from models.dino import DINOv2Teacher
 from dataloader.data_loader import PairedEventImageDataset
-from utils.loss_utils import DistillationLoss, FeatureProjector
+from utils.loss_utils import DistillationLoss
 
 
 def setup_distributed():
@@ -48,20 +47,89 @@ def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
-def get_distributed_dataloader(root_dir, batch_size, seq_len, num_workers, 
-                                split='train', world_size=1, rank=0):
-    """Get dataloader with distributed sampler."""
-    from torch.utils.data import DataLoader
+def safe_wandb_init(args, is_main):
+    """
+    Returns:  wandb_enabled (bool)
+    """
+    if not is_main or args.no_wandb:
+        return False
     
-    dataset = PairedEventImageDataset(
+    os.environ['WANDB_START_METHOD'] = 'thread'
+    os.environ['WANDB_INIT_TIMEOUT'] = '300' 
+    
+    try:
+        print("Initializing wandb...")
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+            resume='allow' if args.resume else None,
+            settings=wandb.Settings(
+                start_method="thread",
+                _service_wait=300,  
+            )
+        )
+        print("✅ Wandb initialized successfully")
+        return True
+    except Exception as e:
+        print(f"⚠️  Wandb initialization failed: {e}")
+        print("Continuing training without wandb logging...")
+        return False
+
+
+def safe_wandb_log(data, wandb_enabled):
+    if not wandb_enabled:
+        return
+    
+    try:
+        wandb.log(data)
+    except Exception as e:
+        print(f"⚠️  Wandb logging failed: {e}")
+
+def get_distributed_dataloader(root_dir, batch_size, seq_len, num_workers, 
+                                split='train', world_size=1, rank=0, 
+                                train_ratio=0.9):
+    """
+    Get dataloader with train/val split at sequence level.
+    Ensures frames from same sequence stay together.
+    """
+    from torch.utils.data import DataLoader
+    import numpy as np
+    
+    # Load full dataset
+    full_dataset = PairedEventImageDataset(
         root_dir=root_dir,
         sequence_length=seq_len,
         image_size=(392, 518)
     )
     
+    # Get unique sequences
+    num_sequences = len(full_dataset.sequences)
+    train_seq_count = int(num_sequences * train_ratio)
+    
+    # Split sequences with fixed seed
+    np.random.seed(42)
+    seq_indices = np.random.permutation(num_sequences)
+    
+    if split == 'train':
+        selected_seq_indices = set(seq_indices[:train_seq_count])
+    else:  # val
+        selected_seq_indices = set(seq_indices[train_seq_count:])
+    
+    # Filter samples to only include selected sequences
+    filtered_samples = []
+    for sample in full_dataset.samples:
+        seq_idx = full_dataset.sequences.index(sample['sequence'])
+        if seq_idx in selected_seq_indices: 
+            filtered_samples.append(sample)
+    
+    # Replace dataset samples
+    full_dataset.samples = filtered_samples
+    
+    # Distributed sampler
     if world_size > 1:
         sampler = DistributedSampler(
-            dataset,
+            full_dataset,
             num_replicas=world_size,
             rank=rank,
             shuffle=(split == 'train')
@@ -72,19 +140,90 @@ def get_distributed_dataloader(root_dir, batch_size, seq_len, num_workers,
         shuffle = (split == 'train')
     
     loader = DataLoader(
-        dataset,
+        full_dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     return loader
 
+# def get_distributed_dataloader(root_dir, batch_size, seq_len, num_workers, 
+#                                     split='train', world_size=1, rank=0):
+#         """
+#         Get dataloader for train or test split. 
+#         Train and test data are in separate directories.
+        
+#         Args:
+#             root_dir: Root directory containing 'rgv_interval_train_preprocessed' 
+#                     and 'rgv_interval_test_preprocessed'
+#             batch_size: Batch size per GPU
+#             seq_len:  Sequence length
+#             num_workers:  Number of data loading workers
+#             split: 'train' or 'test'
+#             world_size:  Number of GPUs
+#             rank: Current GPU rank
+#         """
+#         from torch.utils.data import DataLoader
+#         from pathlib import Path
+        
+#         root_dir = Path(root_dir)
+        
+#         # Select appropriate data directory based on split
+#         if split == 'train':
+#             data_dir = root_dir / 'train'
+#         elif split == 'test':
+#             data_dir = root_dir / 'test'
+#         else: 
+#             raise ValueError(f"split must be 'train' or 'test', got {split}")
+        
+#         if not data_dir.exists():
+#             raise FileNotFoundError(f"Data directory not found: {data_dir}")
+        
+#         # Load dataset
+#         dataset = PairedEventImageDataset(
+#             root_dir=data_dir,
+#             sequence_length=seq_len,
+#             image_size=(392, 518)
+#         )
+        
+#         print(f"Loaded {split} dataset from {data_dir}")
+#         print(f"  Sequences: {len(dataset.sequences)}")
+#         print(f"  Samples:  {len(dataset.samples)}")
+        
+#         # Distributed sampler
+#         if world_size > 1:
+#             sampler = DistributedSampler(
+#                 dataset,
+#                 num_replicas=world_size,
+#                 rank=rank,
+#                 shuffle=(split == 'train')
+#             )
+#             shuffle = None
+#         else:
+#             sampler = None
+#             shuffle = (split == 'train')
+        
+#         loader = DataLoader(
+#             dataset,
+#             batch_size=batch_size,
+#             shuffle=shuffle,
+#             sampler=sampler,
+#             num_workers=num_workers,
+#             pin_memory=True,
+#             drop_last=(split == 'train'),  # Only drop last batch for training
+#             persistent_workers=True if num_workers > 0 else False,
+#             prefetch_factor=2 if num_workers > 0 else None
+#         )
+        
+#         return loader
 
-class DistillationTrainer: 
+class DistillationTrainer:  
     """
     Trainer for distilling DINOv2 (Teacher) to EvEncoder (Student).
     Supports distributed training and wandb logging.
@@ -113,18 +252,29 @@ class DistillationTrainer:
         
         self._verify_teacher_dimensions()
         
-        # Initialize Student (Trainable)
+        # Initialize Student (Trainable) with projector integrated
         if self.is_main:
-            print("Initializing Student: EvEncoder...")
-        self.student = EvEncoder(in_channels=args.event_voxel_bin_num, out_channels=16).to(self.device)
-        
-        # Initialize Projector
-        self.projector = FeatureProjector(
-            in_channels=16,
-            out_channels=self.teacher_embed_dim
-        ).to(self.device)
+            print("Initializing Student:  EvEncoder with projector...")
+        if args.evencoder_type == "evencoder-v1":
+            from models.evencoder import EvEncoder
+            self.student = EvEncoder(
+                in_channels=args.event_voxel_bin_num, 
+                out_channels=16,
+                project_out_channels=self.teacher_embed_dim
+            ).to(self.device)
+        elif args.evencoder_type == "evencoder-v2":
+            from models.evencoder_dinov2 import EvEncoder
+            self.student = EvEncoder(
+                in_channels=args.event_voxel_bin_num, 
+                base_channels=64, 
+                dino_model=args.dino_model,
+                target_res=(392, 518),
+                checkpoint_path=args.teacher_checkpoint_path,
+            ).to(self.device)
+        else:
+            raise ValueError(f"Invalid evencoder type: {args.evencoder_type}")
 
-        # Wrap models with DDP
+        # Wrap model with DDP
         if world_size > 1:
             self.student = DDP(
                 self.student,
@@ -132,20 +282,13 @@ class DistillationTrainer:
                 output_device=local_rank,
                 find_unused_parameters=False
             )
-            self.projector = DDP(
-                self.projector,
-                device_ids=[local_rank],
-                output_device=local_rank,
-                find_unused_parameters=False
-            )
 
         # Get actual model for saving (unwrap DDP if needed)
         self.student_module = self.student.module if hasattr(self.student, 'module') else self.student
-        self.projector_module = self.projector.module if hasattr(self.projector, 'module') else self.projector
 
-        # Optimizer
+        # Optimizer (projector is part of student now)
         self.optimizer = optim.AdamW(
-            list(self.student.parameters()) + list(self.projector.parameters()),
+            self.student.parameters(),
             lr=args.lr,
             weight_decay=1e-4
         )
@@ -159,15 +302,12 @@ class DistillationTrainer:
         # Loss Function
         self.criterion = DistillationLoss().to(self.device)
         
-        # Initialize wandb
-        if self.is_main and not args.no_wandb:
-            wandb.init(
-                project=args.wandb_project,
-                name=args.wandb_run_name,
-                config=vars(args),
-                resume='allow' if args.resume else None
-            )
-            wandb.watch(self.student, log='all', log_freq=100)
+        self.wandb_enabled = safe_wandb_init(args, self.is_main)
+        if self.wandb_enabled:
+            try:
+                wandb.watch(self.student, log='all', log_freq=100)
+            except Exception as e: 
+                print(f"⚠️  wandb.watch failed: {e}")
 
     def _verify_teacher_dimensions(self):
         """Verify and store teacher output dimensions."""
@@ -204,36 +344,38 @@ class DistillationTrainer:
         # 1 Teacher Forward (Frozen)
         with torch.no_grad():
             flat_images = images.view(B_T, C_img, H_img, W_img)
-            teacher_tokens = self.teacher(flat_images)  # [B*T, N_patches, Embed_dim]
+            teacher_tokens = self.teacher(flat_images)
 
-        # 2 Student Forward
-        student_output, _ = self.student(events)  # [B, T, C_out, H_enc, W_enc]
-        _, _, C_out, H_enc, W_enc = student_output.shape
-        student_flat = student_output.view(B_T, C_out, H_enc, W_enc)  # [B*T, C_out, H_enc, W_enc]
-
-        # 3Project Student Features
-        student_proj = self.projector(student_flat)  # [B*T, Embed_dim, H_enc, W_enc]
-        # import pdb; pdb.set_trace()
-        # 4Convert Student to Token Format
-        # Flatten spatial dimensions:  [B*T, Embed_dim, H_enc, W_enc] -> [B*T, Embed_dim, H_enc*W_enc]
-        B_T_check, Embed_dim, H_enc, W_enc = student_proj.shape
-        student_tokens = student_proj.view(B_T_check, Embed_dim, H_enc * W_enc)  # [B*T, Embed_dim, N_student_patches]
-        student_tokens = student_tokens.transpose(1, 2)  # [B*T, N_student_patches, Embed_dim]
+        # 2 Student Forward (with projector applied)
+        # For evencoder-v1, use_projector=True; for evencoder-v2, projector is integrated
+        if self.args.evencoder_type == "evencoder-v1":
+            student_output, _ = self.student(events, use_projector=True)
+            # evencoder-v1 output: [B, T, C_out, H_enc, W_enc]
+            _, _, C_out, H_enc, W_enc = student_output.shape
+            student_proj = student_output.view(B_T, C_out, H_enc, W_enc)
+            # Convert to token format: [B*T, N_patches, Embed_dim]
+            B_T_check, Embed_dim, H_enc, W_enc = student_proj.shape
+            student_tokens = student_proj.view(B_T_check, Embed_dim, H_enc * W_enc)
+            student_tokens = student_tokens.transpose(1, 2)
+        else:  # evencoder-v2
+            student_output, _ = self.student(events)
+            # evencoder-v2 output: [B, T, N_patches, DINO_Dim] - already in token format
+            student_tokens = student_output.view(B_T, student_output.shape[2], student_output.shape[3])
         
         N_teacher = teacher_tokens.shape[1]
         N_student = student_tokens.shape[1]
         
         if N_student != N_teacher:
-            student_tokens_temp = student_tokens.transpose(1, 2)  # [B*T, Embed_dim, N_student]
+            student_tokens_temp = student_tokens.transpose(1, 2)
             student_tokens_temp = F.interpolate(
-                student_tokens_temp.unsqueeze(-1),  # [B*T, Embed_dim, N_student, 1]
+                student_tokens_temp.unsqueeze(-1),
                 size=(N_teacher, 1),
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(-1)  # [B*T, Embed_dim, N_teacher]
-            student_tokens = student_tokens_temp.transpose(1, 2)  # [B*T, N_teacher, Embed_dim]
+            ).squeeze(-1)
+            student_tokens = student_tokens_temp.transpose(1, 2)
         
-        # 6Compute Loss in Token Space
+        # 6 Compute Loss in Token Space
         loss = self.criterion(student_feat=student_tokens, teacher_feat=teacher_tokens)
         
         return loss
@@ -241,50 +383,12 @@ class DistillationTrainer:
     def train_epoch(self, dataloader, epoch_idx):
         """Train for one epoch."""
         self.student.train()
-        self.projector.train()
         
-        # #region agent log
         epoch_start_time = time.time()
-        if self.is_main:
-            try:
-                with open('/data/fcr/.cursor/debug.log', 'a') as f:
-                    json.dump({
-                        'sessionId': 'debug-session',
-                        'runId': 'pre-fix',
-                        'hypothesisId': 'E',
-                        'location': 'distill.py:243',
-                        'message': 'Epoch start - set_epoch',
-                        'data': {'epoch': epoch_idx, 'timestamp': time.time()},
-                        'timestamp': int(time.time() * 1000)
-                    }, f)
-                    f.write('\n')
-            except Exception as e:
-                print(f"Logging error: {e}")
-        # #endregion
         
         # Set epoch for distributed sampler
-        set_epoch_start = time.time()
         if hasattr(dataloader.sampler, 'set_epoch'):
             dataloader.sampler.set_epoch(epoch_idx)
-        set_epoch_time = time.time() - set_epoch_start
-        
-        # #region agent log
-        if self.is_main:
-            try:
-                with open('/data/fcr/.cursor/debug.log', 'a') as f:
-                    json.dump({
-                        'sessionId': 'debug-session',
-                        'runId': 'pre-fix',
-                        'hypothesisId': 'E',
-                        'location': 'distill.py:252',
-                        'message': 'set_epoch completed',
-                        'data': {'epoch': epoch_idx, 'set_epoch_time': set_epoch_time, 'timestamp': time.time()},
-                        'timestamp': int(time.time() * 1000)
-                    }, f)
-                    f.write('\n')
-            except Exception as e:
-                pass
-        # #endregion
         
         epoch_loss = 0.0
         
@@ -295,169 +399,94 @@ class DistillationTrainer:
         
         batch_times = []
         data_load_times = []
-        wandb_log_times = []
+        batch_start_time = time.time()
         
         for batch_idx, (events, images) in enumerate(pbar):
-            batch_start_time = time.time()
             
-            # #region agent log
-            data_load_start = time.time()
-            # #endregion
-            
-            events = events.to(self.device)
-            images = images.to(self.device)
-            
-            # #region agent log
-            data_load_time = time.time() - data_load_start
+            data_load_time = time.time() - batch_start_time
             data_load_times.append(data_load_time)
-            forward_start = time.time()
-            # #endregion
+            
+            compute_start = time.time()
+            
+            events = events.to(self.device, non_blocking=True)  # ✅ non_blocking
+            images = images.to(self.device, non_blocking=True)
             
             loss = self._process_batch(events, images)
             
-            # #region agent log
-            forward_time = time.time() - forward_start
-            backward_start = time.time()
-            # #endregion
-            
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)  # ✅ 更彻底清理梯度
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                list(self.student.parameters()) + list(self.projector.parameters()),
+                self.student.parameters(),
                 max_norm=1.0
             )
             self.optimizer.step()
             
-            # #region agent log
-            backward_time = time.time() - backward_start
-            batch_time = time.time() - batch_start_time
-            batch_times.append(batch_time)
-            # #endregion
+            # ✅ 立即 detach loss
+            loss_value = loss.detach().item()
+            epoch_loss += loss_value
             
-            epoch_loss += loss.item()
+            compute_time = time.time() - compute_start
+            batch_times.append(compute_time)
             
             # Update progress bar
             if self.is_main:
-                pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
+                pbar.set_postfix({
+                    "Loss": f"{loss_value:.4f}",
+                    "DataT": f"{data_load_time:.2f}s",
+                    "CompT": f"{compute_time:.2f}s"
+                })
                 
-                # Log to wandb
-                if not self.args.no_wandb and batch_idx % self.args.log_interval == 0:
-                    # #region agent log
-                    wandb_log_start = time.time()
-                    # #endregion
-                    
+                # ✅ Log to wandb with safe wrapper
+                if batch_idx % self.args.log_interval == 0:
                     global_step = (epoch_idx - 1) * len(dataloader) + batch_idx
-                    wandb.log({
-                        'train/loss': loss.item(),
+                    safe_wandb_log({
+                        'train/loss': loss_value,
                         'train/lr': self.scheduler.get_last_lr()[0],
+                        'train/data_time': data_load_time,
+                        'train/compute_time': compute_time,
                         'train/epoch': epoch_idx,
                         'train/step': global_step
-                    })
-                    
-                    # #region agent log
-                    wandb_log_time = time.time() - wandb_log_start
-                    wandb_log_times.append(wandb_log_time)
-                    if batch_idx % 50 == 0:  # Log every 50 batches to avoid too much logging
-                        try:
-                            with open('/data/fcr/.cursor/debug.log', 'a') as f:
-                                json.dump({
-                                    'sessionId': 'debug-session',
-                                    'runId': 'pre-fix',
-                                    'hypothesisId': 'B',
-                                    'location': 'distill.py:310',
-                                    'message': 'Batch completed',
-                                    'data': {
-                                        'epoch': epoch_idx,
-                                        'batch_idx': batch_idx,
-                                        'batch_time': batch_time,
-                                        'data_load_time': data_load_time,
-                                        'forward_time': forward_time,
-                                        'backward_time': backward_time,
-                                        'wandb_log_time': wandb_log_time,
-                                        'gpu_memory_allocated_mb': torch.cuda.memory_allocated(self.device) / 1024**2 if torch.cuda.is_available() else 0,
-                                        'gpu_memory_reserved_mb': torch.cuda.memory_reserved(self.device) / 1024**2 if torch.cuda.is_available() else 0,
-                                        'timestamp': time.time()
-                                    },
-                                    'timestamp': int(time.time() * 1000)
-                                }, f)
-                                f.write('\n')
-                        except Exception:
-                            pass
-                    # #endregion
+                    }, self.wandb_enabled)
+            
+            del events, images, loss
+            if batch_idx % 50 == 0:
+                torch.cuda.empty_cache()
+            
+            batch_start_time = time.time()
         
         # Gather losses from all processes
-        # #region agent log
-        gather_start = time.time()
-        # #endregion
-        
         if self.world_size > 1:
             epoch_loss_tensor = torch.tensor(epoch_loss).to(self.device)
             dist.all_reduce(epoch_loss_tensor, op=dist.ReduceOp.SUM)
             epoch_loss = epoch_loss_tensor.item() / self.world_size
-        
-        # #region agent log
-        gather_time = time.time() - gather_start
-        epoch_total_time = time.time() - epoch_start_time
-        # #endregion
+            del epoch_loss_tensor
         
         avg_loss = epoch_loss / len(dataloader)
+        epoch_time = time.time() - epoch_start_time
         
         if self.is_main:
+            avg_data_time = sum(data_load_times) / len(data_load_times) if data_load_times else 0
+            avg_compute_time = sum(batch_times) / len(batch_times) if batch_times else 0
+            
             print(f"Epoch {epoch_idx} Avg Loss: {avg_loss:.5f}")
+            print(f"  Total Time: {epoch_time:.1f}s")
+            print(f"  Avg Data Load:  {avg_data_time:.3f}s")
+            print(f"  Avg Compute:  {avg_compute_time:.3f}s")
+            print(f"  Data/Compute Ratio: {avg_data_time/avg_compute_time:.2f}")
             
-            # #region agent log
-            epoch_wandb_start = time.time()
-            # #endregion
-            
-            if not self.args.no_wandb:
-                wandb.log({
-                    'train/epoch_loss': avg_loss,
-                    'epoch': epoch_idx
-                })
-            
-            # #region agent log
-            epoch_wandb_time = time.time() - epoch_wandb_start
-            avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
-            avg_data_load_time = sum(data_load_times) / len(data_load_times) if data_load_times else 0
-            max_batch_time = max(batch_times) if batch_times else 0
-            min_batch_time = min(batch_times) if batch_times else 0
-            try:
-                with open('/data/fcr/.cursor/debug.log', 'a') as f:
-                    json.dump({
-                        'sessionId': 'debug-session',
-                        'runId': 'pre-fix',
-                        'hypothesisId': 'A',
-                        'location': 'distill.py:360',
-                        'message': 'Epoch completed',
-                        'data': {
-                            'epoch': epoch_idx,
-                            'epoch_total_time': epoch_total_time,
-                            'set_epoch_time': set_epoch_time,
-                            'gather_time': gather_time,
-                            'epoch_wandb_time': epoch_wandb_time,
-                            'avg_batch_time': avg_batch_time,
-                            'max_batch_time': max_batch_time,
-                            'min_batch_time': min_batch_time,
-                            'avg_data_load_time': avg_data_load_time,
-                            'total_wandb_log_time': sum(wandb_log_times),
-                            'num_batches': len(batch_times),
-                            'gpu_memory_allocated_mb': torch.cuda.memory_allocated(self.device) / 1024**2 if torch.cuda.is_available() else 0,
-                            'gpu_memory_reserved_mb': torch.cuda.memory_reserved(self.device) / 1024**2 if torch.cuda.is_available() else 0,
-                            'timestamp': time.time()
-                        },
-                        'timestamp': int(time.time() * 1000)
-                    }, f)
-                    f.write('\n')
-            except Exception as e:
-                print(f"Logging error: {e}")
-            # #endregion
+            safe_wandb_log({
+                'train/epoch_loss': avg_loss,
+                'train/epoch_time': epoch_time,
+                'train/avg_data_time': avg_data_time,
+                'train/avg_compute_time': avg_compute_time,
+                'epoch': epoch_idx
+            }, self.wandb_enabled)
         
         return avg_loss
 
     def validate(self, dataloader, epoch_idx):
         """Validate the model."""
         self.student.eval()
-        self.projector.eval()
         
         val_loss = 0.0
         
@@ -467,31 +496,37 @@ class DistillationTrainer:
             pbar = dataloader
         
         with torch.no_grad():
-            for events, images in pbar:
-                events = events.to(self.device)
-                images = images.to(self.device)
+            for batch_idx, (events, images) in enumerate(pbar):
+                events = events.to(self.device, non_blocking=True)
+                images = images.to(self.device, non_blocking=True)
                 
                 loss = self._process_batch(events, images)
                 val_loss += loss.item()
                 
                 if self.is_main:
                     pbar.set_postfix({"Val Loss": f"{loss.item():.4f}"})
+                
+                # ✅ 显式删除
+                del events, images, loss
+                
+                if batch_idx % 50 == 0:
+                    torch.cuda.empty_cache()
         
         # Gather losses from all processes
         if self.world_size > 1:
             val_loss_tensor = torch.tensor(val_loss).to(self.device)
             dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
             val_loss = val_loss_tensor.item() / self.world_size
+            del val_loss_tensor
         
         avg_loss = val_loss / len(dataloader)
         
         if self.is_main:
             print(f"Validation Avg Loss: {avg_loss:.5f}")
-            if not self.args.no_wandb:
-                wandb.log({
-                    'val/loss': avg_loss,
-                    'epoch': epoch_idx
-                })
+            safe_wandb_log({
+                'val/loss': avg_loss,
+                'epoch': epoch_idx
+            }, self.wandb_enabled)
         
         return avg_loss
 
@@ -500,80 +535,42 @@ class DistillationTrainer:
         if not self.is_main:
             return
         
-        # #region agent log
-        checkpoint_start = time.time()
-        # #endregion
-        
         checkpoint = {
             'student':  self.student_module.state_dict(),
-            'projector': self.projector_module.state_dict(),
             'optimizer': self.optimizer.state_dict(),
-            'scheduler':  self.scheduler.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
             'epoch': epoch,
             'loss': loss,
             'args': self.args
         }
         
-        # #region agent log
-        torch_save_start = time.time()
-        # #endregion
-        
         torch.save(checkpoint, path)
-        
-        # #region agent log
-        torch_save_time = time.time() - torch_save_start
-        wandb_save_start = time.time()
-        # #endregion
-        
         print(f"Checkpoint saved to {path}")
         
-        # Save to wandb (non-blocking)
-        wandb_save_time = 0
-        if not self.args.no_wandb:
-            # Use a background thread to avoid blocking training
+        # ✅ Save to wandb in background thread (non-blocking)
+        if self.wandb_enabled:
             def save_to_wandb():
                 try:
-                    wandb.save(path)
-                except Exception as e:
-                    print(f"Warning: Failed to save checkpoint to wandb: {e}")
+                    wandb.save(path, policy='now')
+                except Exception as e: 
+                    print(f"⚠️  Failed to save checkpoint to wandb: {e}")
             
             wandb_thread = threading.Thread(target=save_to_wandb, daemon=True)
             wandb_thread.start()
-            # Note: wandb_save_time is 0 because it's now non-blocking
-        
-        # #region agent log
-        checkpoint_total_time = time.time() - checkpoint_start
-        try:
-            with open('/data/fcr/.cursor/debug.log', 'a') as f:
-                json.dump({
-                    'sessionId': 'debug-session',
-                    'runId': 'pre-fix',
-                    'hypothesisId': 'C',
-                    'location': 'distill.py:343',
-                    'message': 'Checkpoint saved',
-                    'data': {
-                        'epoch': epoch,
-                        'path': path,
-                        'checkpoint_total_time': checkpoint_total_time,
-                        'torch_save_time': torch_save_time,
-                        'wandb_save_time': wandb_save_time,
-                        'timestamp': time.time()
-                    },
-                    'timestamp': int(time.time() * 1000)
-                }, f)
-                f.write('\n')
-        except Exception as e:
-            print(f"Logging error: {e}")
-        # #endregion
 
     def load_checkpoint(self, path):
         """Load checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
         self.student_module.load_state_dict(checkpoint['student'])
-        self.projector_module.load_state_dict(checkpoint['projector'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-        if 'scheduler' in checkpoint: 
+        if 'scheduler' in checkpoint:  
             self.scheduler.load_state_dict(checkpoint['scheduler'])
+        
+        # Handle legacy checkpoints that had separate projector
+        if 'projector' in checkpoint:
+            if self.is_main:
+                print("⚠️  Legacy checkpoint detected with separate projector. "
+                      "Projector is now integrated into EvEncoder, skipping separate projector load.")
         
         if self.is_main:
             print(f"Checkpoint loaded from {path}")
@@ -592,8 +589,13 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     
     # Hardware
-    parser.add_argument("--num_workers", type=int, default=32)
+    parser.add_argument("--num_workers", type=int, default=4) 
     
+    # Data split
+    parser.add_argument("--val_ratio", type=float, default=0.1,
+                        help="Validation set ratio (default: 0.1)")
+    parser.add_argument("--split_seed", type=int, default=42,
+                        help="Random seed for train/val split")    
     # Paths
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--data_path", type=str, default="./data/precessed_data")
@@ -603,7 +605,7 @@ def main():
     parser.add_argument("--dino_model", type=str, default="dinov2_vitl14_reg")
     parser.add_argument("--teacher_checkpoint_path", type=str, default=None)
     parser.add_argument("--event_voxel_bin_num", type=int, default=8)
-    
+    parser.add_argument("--evencoder_type",type=str,choices=["evencoder-v1", "evencoder-v2"], default="evencoder-v1")
     # Wandb
     parser.add_argument("--no_wandb", action='store_true',
                         help="Disable wandb logging")
@@ -631,7 +633,7 @@ def main():
     
     os.makedirs(args.save_dir, exist_ok=True)
     
-    # DataLoaders with distributed sampling
+    # DataLoaders with split
     train_loader = get_distributed_dataloader(
         root_dir=args.data_path,
         batch_size=args.batch_size,
@@ -639,7 +641,7 @@ def main():
         num_workers=args.num_workers,
         split='train',
         world_size=world_size,
-        rank=rank
+        rank=rank,
     )
     
     val_loader = get_distributed_dataloader(
@@ -649,8 +651,10 @@ def main():
         num_workers=args.num_workers,
         split='val',
         world_size=world_size,
-        rank=rank
+        rank=rank,
     )
+        # random_seed=args.split_seed
+        # val_ratio=args.val_ratio,
     
     if is_main_process():
         print(f"Train batches: {len(train_loader)}")
@@ -702,14 +706,20 @@ def main():
         
         if is_main_process():
             print(f"\nTraining Complete!  Best Val Loss: {best_val_loss:.5f}")
-            if not args.no_wandb:
-                wandb.finish()
+            if trainer.wandb_enabled:  # ✅ 使用 wandb_enabled 标志
+                try:
+                    wandb.finish()
+                except Exception as e: 
+                    print(f"⚠️  wandb.finish() failed: {e}")
     
     except KeyboardInterrupt:
         if is_main_process():
             print("\nTraining interrupted by user")
-            if not args.no_wandb:
-                wandb.finish()
+            if trainer.wandb_enabled:
+                try:
+                    wandb.finish()
+                except:
+                    pass
     
     finally:
         cleanup_distributed()

@@ -58,7 +58,7 @@ class StreamVGGTInference:
             )
             ckpt = torch.load(checkpoint_path, map_location="cpu")
             ckpt = self._strip_patch_embed_keys_if_needed(ckpt)
-            model.load_state_dict(ckpt, strict=self.extractor != "evencoder")
+            model.load_state_dict(ckpt, strict=self.extractor not in ("evencoder", "evencoder-v2"))
             del ckpt
         else:
             print("Local checkpoint not found, downloading from Hugging Face...")
@@ -77,7 +77,7 @@ class StreamVGGTInference:
             )
             ckpt = torch.load(path, map_location="cpu")
             ckpt = self._strip_patch_embed_keys_if_needed(ckpt)
-            model.load_state_dict(ckpt, strict=self.extractor != "evencoder")
+            model.load_state_dict(ckpt, strict=self.extractor not in ("evencoder", "evencoder-v2"))
             del ckpt
         
         model.to(self.device)
@@ -85,12 +85,55 @@ class StreamVGGTInference:
         print(f"Model loaded on {self.device}")
         return model
 
+    def _resize_event_voxel(self, event_voxel, image_size=(392, 518)):
+        """
+        Resize event voxel grid using nearest neighbor interpolation. 
+        Preserves discrete nature of event data.
+        Same as data_loader.py resize_event_voxel method.
+        """
+        if event_voxel.dim() == 2:
+            event_voxel = event_voxel.unsqueeze(0)
+        elif event_voxel.dim() == 3:
+            if event_voxel.shape[2] < event_voxel.shape[0] and event_voxel.shape[2] < event_voxel.shape[1]:
+                event_voxel = event_voxel.permute(2, 0, 1)
+        
+        event_voxel = event_voxel.unsqueeze(0)
+        
+        # Use nearest neighbor instead of bilinear
+        resized = torch.nn.functional.interpolate(
+            event_voxel, 
+            size=image_size,
+            mode='nearest'  
+        )
+        
+        return resized.squeeze(0)
+
     def _load_event_voxels(self, event_files: List[str]) -> torch.Tensor:
-        """Load stacked event voxel grids from .pt files."""
+        """Load stacked event voxel grids from .pt files and resize them."""
         voxel_list = []
         for path in sorted(event_files):
-            voxel = torch.load(path, map_location="cpu", weights_only=True)
+            try:
+                # Try loading with weights_only=True first (safer)
+                voxel = torch.load(path, map_location="cpu", weights_only=True)
+            except Exception as e:
+                # If that fails, try without weights_only (for older/custom formats)
+                try:
+                    voxel = torch.load(path, map_location="cpu")
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"Failed to load event file {path}. "
+                        f"First error: {e}. Second error: {e2}. "
+                        f"File may be corrupted or in an unsupported format."
+                    )
+            
+            # Ensure it's a tensor
+            if not isinstance(voxel, torch.Tensor):
+                voxel = torch.tensor(voxel)
+            
+            # Resize event voxel to match expected input size (392, 518)
+            voxel = self._resize_event_voxel(voxel, image_size=(392, 518))
             voxel_list.append(voxel)
+        
         if len(voxel_list) == 0:
             raise ValueError("No event tensors found.")
         return torch.stack(voxel_list, dim=0)  # [S, C, H, W]
@@ -106,7 +149,7 @@ class StreamVGGTInference:
         elif "model" in state_dict and isinstance(state_dict["model"], dict):
             state_dict = state_dict["model"]
 
-        if self.extractor != "evencoder":
+        if self.extractor not in ("evencoder", "evencoder-v2"):
             return state_dict
         filtered = {k: v for k, v in state_dict.items() if not k.startswith("aggregator.patch_embed")}
         dropped = len(state_dict) - len(filtered)
@@ -446,11 +489,26 @@ def save_results(predictions, image_paths, output_dir, conf_threshold=0.5):
     
     for i in range(num_frames):
         frame_name = f"frame_{i:06d}"
-        pts = world_points[i].reshape(-1, 3)
-        conf = world_points_conf[i].reshape(-1)
-        img = images[i].transpose(1, 2, 0)
-        img = (img * 255).clip(0, 255).astype(np.uint8)
-        colors = img.reshape(-1, 3)
+        pts_map = world_points[i]
+        conf_map = world_points_conf[i]
+        H_pts, W_pts = pts_map.shape[:2]
+
+        img = images[i]
+        # Collapse non-RGB inputs (e.g., event voxels) to a 3-channel visualization.
+        if img.shape[0] == 3:
+            img_vis = img
+        else:
+            img_vis = np.mean(img, axis=0, keepdims=True)
+            img_vis = np.repeat(img_vis, 3, axis=0)
+
+        # Crop to match the model output resolution (model drops remainder to multiples of 14).
+        img_vis = img_vis[:, :H_pts, :W_pts]
+        img_vis = img_vis.transpose(1, 2, 0)
+        img_vis = (img_vis * 255).clip(0, 255).astype(np.uint8)
+
+        pts = pts_map.reshape(-1, 3)
+        conf = conf_map.reshape(-1)
+        colors = img_vis.reshape(-1, 3)
         
         save_point_cloud_ply(pts, colors, conf, os.path.join(pc_dir, f"{frame_name}.ply"), conf_threshold)
         all_points.append(pts)
@@ -459,7 +517,7 @@ def save_results(predictions, image_paths, output_dir, conf_threshold=0.5):
         
         depth_frame = depth[i, :, : , 0]
         save_depth_map(depth_frame, os.path.join(depth_dir, frame_name))
-        cv2.imwrite(os.path.join(img_dir, f"{frame_name}.png"), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(img_dir, f"{frame_name}.png"), cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR))
     
     merged_points = np.concatenate(all_points, axis=0)
     merged_colors = np.concatenate(all_colors, axis=0)
@@ -492,7 +550,7 @@ def main():
     parser.add_argument("--fps_interval", type=float, default=1.0, help="For video: extract one frame every N seconds")
     parser.add_argument("--conf_threshold", type=float, default=0.5, help="Confidence threshold for point cloud filtering (0-1)")
     parser.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
-    parser.add_argument("--extractor", type=str, default="dino", choices=["dino", "evencoder"],
+    parser.add_argument("--extractor", type=str, default="dino", choices=["dino", "evencoder","evencoder-v2"],
                         help="Feature extractor to use for patch tokens")
     parser.add_argument("--evencoder_checkpoint", type=str, default=None,
                         help="Path to EvEncoder checkpoint (expects keys 'student' and 'projector')")

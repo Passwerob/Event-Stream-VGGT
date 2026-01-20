@@ -2,6 +2,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class FeatureProjector(nn.Module):
+    """
+    Aligns the Student's output dimensions to the Teacher's dimensions.
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # 1x1 Conv to map channels (e. g., 16 -> 1024)
+        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.proj(x)
+    
 class ResBlock(nn.Module):
     """
     Conv -> Norm -> SiLU -> Conv -> Norm -> (Skip Connection)
@@ -97,12 +109,13 @@ class EvEncodBlockBone(nn.Module):
         return out, h_curr
 
 class EvEncoder(nn.Module):
-    def __init__(self, in_channels=8, base_channels=64, out_channels=16):
+    def __init__(self, in_channels=8, base_channels=64, out_channels=16, project_out_channels=None):
         """
         Args:
             in_channels: Voxel Grid channels
             base_channels: Hidden Layer channels
             out_channels: Latent Feature channels
+            project_out_channels: Optional output channels for projector (e.g., for distillation to teacher)
         """
         super().__init__()
         
@@ -116,13 +129,20 @@ class EvEncoder(nn.Module):
         self.stage3 = EvEncodBlockBone(base_channels * 4, base_channels * 4)
         self.out_proj = nn.Conv2d(base_channels * 4, out_channels, kernel_size=3, padding=1)
         
-    def forward(self, voxel_grid, hidden_states=None):
+        # Optional projector for distillation
+        if project_out_channels is not None:
+            self.projector = FeatureProjector(out_channels, project_out_channels)
+        else:
+            self.projector = None
+        
+    def forward(self, voxel_grid, hidden_states=None, use_projector=False):
         """
         Args:
             voxel_grid: [B, T, C_in, H, W]
             hidden_states: list of tensors
+            use_projector: If True, apply projector to output (only if projector is initialized)
         Returns:
-            z: [B, T, C_out, H/8, W/8]
+            z: [B, T, C_out, H/8, W/8] (or projected if use_projector=True)
             last_states: list of tensors
         """
         B, T, C, H, W = voxel_grid.shape
@@ -139,6 +159,11 @@ class EvEncoder(nn.Module):
             feat, h3 = self.stage3(feat, hidden_states[2]) # feat [B, 256, H/4, W/4] -> [B, 256, H/8, W/8]
             
             z_t = self.out_proj(feat) # [B, 16, H/8, W/8]
+            
+            # Apply projector if requested and available
+            if use_projector and self.projector is not None:
+                z_t = self.projector(z_t)
+            
             z_list.append(z_t)
             hidden_states = [h1, h2, h3]
             

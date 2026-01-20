@@ -1,0 +1,109 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>3D Point Cloud Viewer</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #fff; }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            color: black;
+            font-family: sans-serif;
+            pointer-events: none;
+            z-index: 100;
+        }
+    </style>
+    <!-- 引入 Three.js -->
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.154.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.154.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="info">
+        <b>StreamVGGT Point Cloud Viewer</b><br/>
+        Left Click: Rotate | Right Click: Pan | Scroll: Zoom
+    </div>
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
+
+        let camera, scene, renderer, controls;
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xffffff);
+
+            // 相机设置
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 100);
+            camera.position.set(0, 0, 2);
+
+            // 渲染器设置
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // 控制器
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+
+            // 加载 PLY 模型
+            const loader = new PLYLoader();
+            console.log("Loading model...");
+            loader.load('./model.ply', function (geometry) {
+                
+                // 自动居中模型
+                geometry.computeBoundingBox();
+                const center = new THREE.Vector3();
+                geometry.boundingBox.getCenter(center);
+                geometry.translate(-center.x, -center.y, -center.z);
+                
+                // 材质设置
+                let material;
+                if (geometry.hasAttribute('color')) {
+                    material = new THREE.PointsMaterial({ size: 0.005, vertexColors: true });
+                } else {
+                    material = new THREE.PointsMaterial({ size: 0.005, color: 0x00ff00 });
+                }
+
+                const particles = new THREE.Points(geometry, material);
+                scene.add(particles);
+
+                console.log("Loaded point cloud");
+
+            }, undefined, (error) => {
+                console.error(error);
+            });
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>

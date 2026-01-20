@@ -56,6 +56,28 @@ class EvEncoderPatchEmbed(nn.Module):
         return tokens
 
 
+class EvEncoderV2PatchEmbed(nn.Module):
+    """Wrap EvEncoder-v2 (DINO tokens) to match StreamVGGT patch token shape."""
+
+    def __init__(self, encoder: nn.Module):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, voxel_seq: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            voxel_seq: [B, S, C, H, W] event voxel sequence.
+        Returns:
+            tokens: [B*S, N_patches, embed_dim]
+        """
+        if voxel_seq.dim() != 5:
+            raise ValueError(f"Expected 5D input [B, S, C, H, W], got {voxel_seq.shape}")
+
+        encoder_out, _ = self.encoder(voxel_seq)
+        B, S, P, D = encoder_out.shape
+        return encoder_out.reshape(B * S, P, D)
+
+
 class Aggregator(nn.Module):
     """
     The Aggregator applies alternating-attention over input frames,
@@ -114,7 +136,9 @@ class Aggregator(nn.Module):
     ):
         super().__init__()
 
-        self.use_evencoder = patch_embed == "evencoder"
+        self.patch_embed_type = patch_embed
+        self.use_evencoder = patch_embed in {"evencoder", "evencoder-v2"}
+        self.use_evencoder_v2 = patch_embed == "evencoder-v2"
 
         self.__build_patch_embed__(
             patch_embed,
@@ -226,6 +250,22 @@ class Aggregator(nn.Module):
 
         if "conv" in patch_embed:
             self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=3, embed_dim=embed_dim)
+        elif patch_embed == "evencoder-v2":
+            from evencoder.models.evencoder_dinov2 import EvEncoder
+
+            # Pass evencoder_ckpt_path to EvEncoder so DINOv2 can extract weights from it
+            # This avoids downloading DINOv2 weights when they're already in the checkpoint
+            encoder = EvEncoder(in_channels=evencoder_in_channels, evencoder_checkpoint_path=evencoder_ckpt_path)
+            encoder.requires_grad_(False)
+
+            self.patch_embed = EvEncoderV2PatchEmbed(encoder=encoder)
+            self._load_evencoder_weights(
+                evencoder_ckpt_path,
+                encoder,
+                projector=None,
+                student_key=evencoder_student_key,
+                projector_key=None,
+            )
         elif patch_embed == "evencoder":
             from evencoder.models.evencoder import EvEncoder
             from evencoder.utils.loss_utils import FeatureProjector
@@ -308,8 +348,11 @@ class Aggregator(nn.Module):
             images = (images - self._resnet_mean.to(images.device)) / self._resnet_std.to(images.device)
 
         # Reshape to [B*S, C, H, W] for patch embedding
-        images = images.reshape(B * S, C_in, H, W)
-        patch_tokens = self.patch_embed(images)
+        if self.use_evencoder_v2:
+            patch_tokens = self.patch_embed(images)
+        else:
+            images = images.reshape(B * S, C_in, H, W)
+            patch_tokens = self.patch_embed(images)
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
@@ -330,9 +373,26 @@ class Aggregator(nn.Module):
 
         pos = None
         if self.rope is not None:
-            pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
+            grid_h = H // self.patch_size
+            grid_w = W // self.patch_size
 
-        if self.patch_start_idx > 0:
+            if self.use_evencoder_v2:
+                enc = getattr(self.patch_embed, "encoder", None)
+                grid_h = getattr(enc, "grid_h", grid_h)
+                grid_w = getattr(enc, "grid_w", grid_w)
+
+            # Align grid to the actual number of patch tokens to avoid reshape errors
+            actual_patches = patch_tokens.shape[1]
+            expected_patches = grid_h * grid_w
+            if expected_patches != actual_patches and actual_patches > 0:
+                if grid_w > 0 and actual_patches % grid_w == 0:
+                    grid_h = actual_patches // grid_w
+                else:
+                    grid_h, grid_w = actual_patches, 1
+
+            pos = self.position_getter(B * S, grid_h, grid_w, device=images.device)
+
+        if self.patch_start_idx > 0 and pos is not None:
             # do not use position embedding for special tokens (camera and register tokens)
             # so set pos to 0 for the special tokens
             pos = pos + 1
@@ -459,11 +519,11 @@ class Aggregator(nn.Module):
         self,
         ckpt_path: Optional[str],
         encoder: nn.Module,
-        projector: nn.Module,
+        projector: Optional[nn.Module],
         student_key: str = "student",
-        projector_key: str = "projector",
+        projector_key: Optional[str] = "projector",
     ) -> None:
-        """Load EvEncoder + projector weights while keeping StreamVGGT compatibility."""
+        """Load EvEncoder (and optional projector) weights while keeping StreamVGGT compatibility."""
         if ckpt_path is None:
             logger.info("EvEncoder checkpoint path not provided; using random init for extractor.")
             return
@@ -494,7 +554,8 @@ class Aggregator(nn.Module):
 
         if isinstance(ckpt, dict):
             student_state = ckpt.get(student_key) or ckpt.get("state_dict") or ckpt.get("model") or ckpt
-            projector_state = ckpt.get(projector_key)
+            if projector is not None and projector_key is not None:
+                projector_state = ckpt.get(projector_key)
         else:
             student_state = ckpt
 
@@ -505,7 +566,7 @@ class Aggregator(nn.Module):
         else:
             logger.warning("No student weights found in EvEncoder checkpoint.")
 
-        if projector_state is not None:
+        if projector is not None and projector_state is not None:
             proj_msg = projector.load_state_dict(projector_state, strict=False)
             if proj_msg.missing_keys or proj_msg.unexpected_keys:
                 logger.info(f"Projector load_state_dict info - missing: {len(proj_msg.missing_keys)}, unexpected: {len(proj_msg.unexpected_keys)}")

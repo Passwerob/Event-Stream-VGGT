@@ -3,3 +3,4 @@
 
 from .evencoder import EvEncoder
 from .dino import DINOv2Teacher
+from .evencoder_dinov2 import EvEncoder
