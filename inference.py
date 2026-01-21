@@ -335,9 +335,25 @@ def save_results(predictions, image_paths, output_dir, conf_threshold=0.5):
     
     print(f"Saving results for {num_frames} frames...")
     
+    def transform_points_to_reference(points, extrinsic, extrinsic_ref):
+        """Transform camera-space points into the reference camera coordinate frame."""
+        points_flat = points.reshape(-1, 3)
+        R_i = extrinsic[:3, :3]
+        t_i = extrinsic[:3, 3]
+        R_ref = extrinsic_ref[:3, :3]
+        t_ref = extrinsic_ref[:3, 3]
+        world_points = (R_i.T @ (points_flat - t_i).T).T
+        ref_points = (R_ref @ world_points.T).T + t_ref
+        return ref_points.reshape(points.shape)
+
+    extrinsic_ref = extrinsic[0] if extrinsic is not None else None
+
     for i in range(num_frames):
         frame_name = f"frame_{i:06d}"
-        pts = world_points[i].reshape(-1, 3)
+        pts_map = world_points[i]
+        if extrinsic_ref is not None:
+            pts_map = transform_points_to_reference(pts_map, extrinsic[i], extrinsic_ref)
+        pts = pts_map.reshape(-1, 3)
         conf = world_points_conf[i].reshape(-1)
         img = images[i].transpose(1, 2, 0)
         img = (img * 255).clip(0, 255).astype(np.uint8)
