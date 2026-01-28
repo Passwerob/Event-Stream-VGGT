@@ -113,14 +113,16 @@ def create_html(web_dir):
 <body>
     <div id="info">
         <b>StreamVGGT Point Cloud Viewer</b><br/>
-        Left Click: Rotate | Right Click: Pan | Scroll: Zoom
+        Left Click: Rotate | Right Click: Pan | Scroll: Zoom<br/>
+        WASD: Move Camera (Fly Mode)
     </div>
     <script type="module">
         import * as THREE from 'three';
-        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
         import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
 
         let camera, scene, renderer, controls;
+        const keys = { w: false, a: false, s: false, d: false };
 
         init();
         animate();
@@ -131,7 +133,8 @@ def create_html(web_dir):
 
             // 相机设置
             camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 100);
-            camera.position.set(0, 0, 2);
+            // camera.position.set(0, 0, 2);
+            camera.position.set(2, 2, 2); // 设为对角位置 (Diagonal View)
 
             // 渲染器设置
             renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -140,9 +143,11 @@ def create_html(web_dir):
             document.body.appendChild(renderer.domElement);
 
             // 控制器
-            controls = new OrbitControls(camera, renderer.domElement);
-            controls.enableDamping = true;
-            controls.dampingFactor = 0.05;
+            controls = new TrackballControls(camera, renderer.domElement);
+            controls.rotateSpeed = 2.0;
+            controls.zoomSpeed = 1.2;
+            controls.panSpeed = 0.8;
+            controls.dynamicDampingFactor = 0.3;
 
             // 加载 PLY 模型
             const loader = new PLYLoader();
@@ -164,6 +169,7 @@ def create_html(web_dir):
                 }
 
                 const particles = new THREE.Points(geometry, material);
+                particles.scale.set(-1, -1, -1); // X, Y, Z轴全部反转 (Invert All Axes)
                 scene.add(particles);
 
                 console.log("Loaded point cloud");
@@ -173,16 +179,53 @@ def create_html(web_dir):
             });
 
             window.addEventListener('resize', onWindowResize);
+            
+            window.addEventListener('keydown', (e) => {
+                const key = e.key.toLowerCase();
+                if (keys.hasOwnProperty(key)) keys[key] = true;
+            });
+            window.addEventListener('keyup', (e) => {
+                const key = e.key.toLowerCase();
+                if (keys.hasOwnProperty(key)) keys[key] = false;
+            });
         }
 
         function onWindowResize() {
             camera.aspect = window.innerWidth / window.innerHeight;
             camera.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
+            controls.handleResize();
         }
 
         function animate() {
             requestAnimationFrame(animate);
+
+            // WASD Movement
+            if (keys.w || keys.a || keys.s || keys.d) {
+                const moveSpeed = 0.05; 
+                const dir = new THREE.Vector3();
+                camera.getWorldDirection(dir);
+                const right = new THREE.Vector3();
+                right.crossVectors(dir, camera.up).normalize();
+
+                if (keys.w) {
+                    camera.position.addScaledVector(dir, moveSpeed);
+                    controls.target.addScaledVector(dir, moveSpeed);
+                }
+                if (keys.s) {
+                    camera.position.addScaledVector(dir, -moveSpeed);
+                    controls.target.addScaledVector(dir, -moveSpeed);
+                }
+                if (keys.a) {
+                    camera.position.addScaledVector(right, -moveSpeed);
+                    controls.target.addScaledVector(right, -moveSpeed);
+                }
+                if (keys.d) {
+                    camera.position.addScaledVector(right, moveSpeed);
+                    controls.target.addScaledVector(right, moveSpeed);
+                }
+            }
+
             controls.update();
             renderer.render(scene, camera);
         }

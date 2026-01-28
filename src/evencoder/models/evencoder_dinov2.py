@@ -45,7 +45,6 @@ class ETFModule(nn.Module):
             nn.Conv2d(channels * 2, channels, kernel_size=1), 
             nn.Sigmoid()
         )
-        
     def forward(self, x_curr, h_prev=None):
         if h_prev is None:
             h_prev = torch.zeros_like(x_curr)
@@ -78,9 +77,8 @@ class EvEncodBlockBone(nn.Module):
         return out, h_curr
 
 
-
 class DINOv2(nn.Module):
-    def __init__(self, model_name="dinov2_vitl14_reg", device="cuda", checkpoint_path=None, evencoder_checkpoint_path=None):
+    def __init__(self, model_name="dinov2_vitl14_reg", device="cuda", checkpoint_path=None):
         super().__init__()
         self.device = device
         print(f"Loading Frozen DINOv2: {model_name}...")      
@@ -108,8 +106,8 @@ class DINOv2(nn.Module):
             init_values=1.0,
         ).to(device)
         
-        # Load weights (try EvEncoder checkpoint first, then DINOv2 checkpoint, then download)
-        state_dict = self._load_weights(model_name, checkpoint_path, evencoder_checkpoint_path)
+        # Load weights
+        state_dict = self._load_weights(model_name, checkpoint_path)
         
         if state_dict is not None:
             msg = self.backbone.load_state_dict(state_dict, strict=False)
@@ -133,7 +131,7 @@ class DINOv2(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
             
-    def _load_weights(self, model_name, checkpoint_path=None, evencoder_checkpoint_path=None):
+    def _load_weights(self, model_name, checkpoint_path=None):
         """
         Load model weights from local checkpoint or download from official URL.
         
@@ -142,14 +140,12 @@ class DINOv2(nn.Module):
         - Checkpoint dict with 'state_dict' key: {'state_dict': {...}, ...}
         - Checkpoint dict with 'model' key: {'model': {...}, ...}
         - Checkpoint dict with 'backbone' key: {'backbone': {...}, ...}
-        - EvEncoder checkpoint with 'student' key containing 'dino.backbone.*' keys
         
         Also handles DataParallel artifacts by removing 'module.' prefixes.
         
         Args:
             model_name: Model variant name for URL fallback when local checkpoint unavailable
-            checkpoint_path: Optional path to local DINOv2 checkpoint file (.pt or .pth)
-            evencoder_checkpoint_path: Optional path to EvEncoder checkpoint containing DINOv2 weights
+            checkpoint_path: Optional path to local checkpoint file (.pt or .pth)
             
         Returns:
             state_dict: Cleaned model state dictionary ready for loading, or None if all attempts fail
@@ -162,43 +158,7 @@ class DINOv2(nn.Module):
             "dinov2_vitg2_reg": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_reg4_pretrain.pth",
         }
         
-        # Priority 1: Attempt to load from EvEncoder checkpoint if provided
-        # This avoids downloading weights when they're already in the EvEncoder checkpoint
-        if evencoder_checkpoint_path is not None:
-            abs_ev_ckpt_path = os.path.abspath(evencoder_checkpoint_path)
-            if os.path.exists(abs_ev_ckpt_path):
-                try:
-                    ev_checkpoint = torch.load(abs_ev_ckpt_path, map_location=self.device, weights_only=False)
-                    
-                    # Extract student state_dict
-                    student_state = None
-                    if isinstance(ev_checkpoint, dict):
-                        student_state = ev_checkpoint.get('student') or ev_checkpoint.get('state_dict') or ev_checkpoint.get('model')
-                    else:
-                        student_state = ev_checkpoint
-                    
-                    if student_state is not None and isinstance(student_state, dict):
-                        # Extract DINOv2 backbone weights (keys like 'dino.backbone.*')
-                        dino_state_dict = {}
-                        for key, value in student_state.items():
-                            if key.startswith('dino.backbone.'):
-                                # Remove 'dino.backbone.' prefix to match backbone structure
-                                new_key = key.replace('dino.backbone.', '')
-                                dino_state_dict[new_key] = value
-                        
-                        if len(dino_state_dict) > 0:
-                            print(f"✓ Loaded DINOv2 weights from EvEncoder checkpoint: {abs_ev_ckpt_path}")
-                            print(f"  Extracted {len(dino_state_dict)} DINOv2 backbone weights")
-                            return dino_state_dict
-                        else:
-                            print(f"⚠ No DINOv2 weights found in EvEncoder checkpoint, trying other sources...")
-                    else:
-                        print(f"⚠ Could not extract student state from EvEncoder checkpoint, trying other sources...")
-                except Exception as e:
-                    print(f"⚠ Error loading EvEncoder checkpoint {abs_ev_ckpt_path}: {e}")
-                    print(f"  Trying other sources...")
-        
-        # Priority 2: Attempt to load from local DINOv2 checkpoint if path is provided
+        # Priority 1: Attempt to load from local checkpoint if path is provided
         if checkpoint_path is not None:
             abs_checkpoint_path = os.path.abspath(checkpoint_path)
             
@@ -239,7 +199,7 @@ class DINOv2(nn.Module):
                 print(f"⚠ Checkpoint file not found: {abs_checkpoint_path}")
                 print(f"Falling back to URL download...")
         
-        # Priority 3: Download from official DINOv2 repository as fallback
+        # Priority 2: Download from official DINOv2 repository as fallback
         if model_name in DINOV2_WEIGHTS_URLS:
             url = DINOV2_WEIGHTS_URLS[model_name]
             print(f"Downloading weights from official URL: {url}")
@@ -326,16 +286,17 @@ class EvEncoder(nn.Module):
                  base_channels=64, 
                  dino_model="dinov2_vitl14_reg",
                  checkpoint_path=None,
-                 evencoder_checkpoint_path=None,
-                 target_res=(392, 518)):
+                 target_res=(392, 518),
+                 enable_decoder=False,
+                 recon_out_channels=1):
         """
         Args:
             in_channels: Event voxel channels.
             base_channels: Channel multiplier for EvEncoder.
             dino_model: Which DINOv2 backbone to use.
-            checkpoint_path: Optional path to DINOv2 checkpoint (deprecated, use evencoder_checkpoint_path)
-            evencoder_checkpoint_path: Optional path to EvEncoder checkpoint containing DINOv2 weights
             target_res: (H, W) The target RGB resolution we want to mimic.
+            enable_decoder: Whether to build a decoder for grayscale reconstruction.
+            recon_out_channels: Output channels for reconstruction (default: 1 for grayscale).
         """
         super().__init__()
         
@@ -348,11 +309,28 @@ class EvEncoder(nn.Module):
         self.stage3 = EvEncodBlockBone(base_channels * 4, base_channels * 4) # 256 -> 256
         
         self.ev_out_channels = base_channels * 4 # 256
+
+        self.enable_decoder = enable_decoder
+        if self.enable_decoder:
+            self.decoder = nn.Sequential(
+                nn.Conv2d(self.ev_out_channels, base_channels * 2, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(base_channels // 2, recon_out_channels, kernel_size=3, padding=1),
+                nn.Sigmoid(),
+            )
+        else:
+            self.decoder = None
         
         # --- Part 2: Frozen DINOv2 Backbone ---
-        # Pass evencoder_checkpoint_path to DINOv2 so it can extract weights from it
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dino = DINOv2(dino_model, device=device, checkpoint_path=checkpoint_path, evencoder_checkpoint_path=evencoder_checkpoint_path)
+        self.dino = DINOv2(dino_model, device=device, checkpoint_path=checkpoint_path)
         
         # Calculate grid size based on target resolution
         # 392 // 14 = 28, 518 // 14 = 37
@@ -366,16 +344,19 @@ class EvEncoder(nn.Module):
             nn.Conv2d(self.ev_out_channels, self.dino.embed_dim, kernel_size=1),
             nn.GroupNorm(32, self.dino.embed_dim),
             nn.SiLU(),
+            # Optional: Add another conv layer if more capacity is needed
         )
         
-    def forward(self, voxel_grid, hidden_states=None):
+    def forward(self, voxel_grid, hidden_states=None, return_recon=False):
         """
         Args:
             voxel_grid: [B, T, C_in, H, W]
             hidden_states: List of states for ETF modules
+            return_recon: If True and decoder is enabled, return grayscale reconstruction.
         Returns:
             dino_features: [B, T, N_patches, DINO_Dim]
             next_states: Updated hidden states
+            recon_out: [B, T, 1, H, W] if return_recon else None
         """
         B, T, C, H, W = voxel_grid.shape
         
@@ -386,35 +367,43 @@ class EvEncoder(nn.Module):
         next_states = [None, None, None] # Just placeholders
         
         # 1. Process Temporal Sequence with EvEncoder
+        # We process frame-by-frame for temporal correctness (ETFModule) Note: To optimize speed, we collect features first then run DINO in parallel
         ev_features_list = []
         current_states = hidden_states
+        recon_list = []
         
         for t in range(T):
             x = voxel_grid[:, t]
-            feat = self.stem(x)
+            
+            # Stem
+            feat = self.stem(x) 
+            # Stages
             feat, h1 = self.stage1(feat, current_states[0])
             feat, h2 = self.stage2(feat, current_states[1])
             feat, h3 = self.stage3(feat, current_states[2])
-            ev_features_list.append(feat) # feat shape: [B, 256, H/8, W/8]
+            
+            # feat shape: [B, 256, H/8, W/8]
+            ev_features_list.append(feat)
+
+            if return_recon and self.decoder is not None:
+                recon_list.append(self.decoder(feat))
+            
             current_states = [h1, h2, h3]
             
         # 2. Batch Projection & DINO Injection
-        ev_features = torch.stack(ev_features_list, dim=1) # [B, T, 256, H/8, W/8]
-        flat_ev = ev_features.view(B*T, -1, ev_features.shape[-2], ev_features.shape[-1]) #[B*T, 256, H/8, W/8]
-        proj_feat = self.projector(flat_ev) #[B*T, 1024, H/8, W/8]
-        dino_input_map = F.interpolate(
-            proj_feat,
-            size=(self.grid_h, self.grid_w),
-            mode='bilinear',
-            align_corners=False
-        )
+        ev_features = torch.stack(ev_features_list, dim=1) # Stack: [B, T, 256, H/8, W/8]
         
-        # Flatten to tokens: [B*T, 1024, 28*37] -> [B*T, N, 1024]
-        tokens = dino_input_map.flatten(2).transpose(1, 2)
-        dino_out = self.dino.forward_from_latent(tokens, grid_size=(self.grid_h, self.grid_w))
-        dino_out = dino_out.view(B, T, -1, self.dino.embed_dim)
+        # Flatten Batch and Time for efficient parallel processing
+        flat_ev = ev_features.view(B*T, -1, ev_features.shape[-2], ev_features.shape[-1]) # [B*T, 256, H/8, W/8]
+        proj_feat = self.projector(flat_ev) # Project: [B*T, 1024, H/8, W/8]
         
-        return dino_out, current_states
+        dino_input_map = F.interpolate(proj_feat, size=(self.grid_h, self.grid_w), mode='bilinear', align_corners=False) # Interpolate to DINO Grid Size: [B*T, 1024, 28, 37] TODO: check if this is correct
+        tokens = dino_input_map.flatten(2).transpose(1, 2) # Flatten to tokens: [B*T, 1024, 28*37] -> [B*T, N, 1024]
+        dino_out = self.dino.forward_from_latent(tokens, grid_size=(self.grid_h, self.grid_w)) # [B*T, N, 1024] -> [B*T, N, 1024]
+        dino_out = dino_out.view(B, T, -1, self.dino.embed_dim) # [B*T, N, 1024] -> [B, T, N, 1024]
+        
+        recon_out = torch.stack(recon_list, dim=1) if recon_list else None
+        return dino_out, recon_out, current_states
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"

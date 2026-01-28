@@ -15,7 +15,7 @@ import threading
 
 from models.dino import DINOv2Teacher
 from dataloader.data_loader import PairedEventImageDataset
-from utils.loss_utils import DistillationLoss
+from utils.loss_utils import DistillationLoss, PerceptualLoss
 
 
 def setup_distributed():
@@ -260,8 +260,10 @@ class DistillationTrainer:
             self.student = EvEncoder(
                 in_channels=args.event_voxel_bin_num, 
                 out_channels=16,
-                project_out_channels=self.teacher_embed_dim
+                project_out_channels=self.teacher_embed_dim,
+                enable_decoder=args.recon_loss
             ).to(self.device)
+        
         elif args.evencoder_type == "evencoder-v2":
             from models.evencoder_dinov2 import EvEncoder
             self.student = EvEncoder(
@@ -270,6 +272,15 @@ class DistillationTrainer:
                 dino_model=args.dino_model,
                 target_res=(392, 518),
                 checkpoint_path=args.teacher_checkpoint_path,
+                enable_decoder=args.recon_loss,
+            ).to(self.device)
+        elif args.evencoder_type == "evencoder-v3":
+            from models.evencoder_e2vid import EvEncoderE2VID
+            self.student = EvEncoderE2VID(
+                in_channels=args.event_voxel_bin_num,
+                out_channels=64,
+                project_out_channels=self.teacher_embed_dim,
+                enable_decoder=args.recon_loss,
             ).to(self.device)
         else:
             raise ValueError(f"Invalid evencoder type: {args.evencoder_type}")
@@ -301,6 +312,10 @@ class DistillationTrainer:
         
         # Loss Function
         self.criterion = DistillationLoss().to(self.device)
+        self.perceptual_loss = PerceptualLoss().to(self.device) if args.recon_loss else None
+
+        self.rgb_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1).to(self.device)
+        self.rgb_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1).to(self.device)
         
         self.wandb_enabled = safe_wandb_init(args, self.is_main)
         if self.wandb_enabled:
@@ -333,6 +348,15 @@ class DistillationTrainer:
                       f"grid={self.teacher_grid_size}x{self.teacher_grid_size}, "
                       f"embed_dim={self.teacher_embed_dim}")
 
+    def _rgb_to_gray(self, images):
+        images = images * self.rgb_std + self.rgb_mean
+        images = images.clamp(0.0, 1.0)
+        r = images[:, :, 0]
+        g = images[:, :, 1]
+        b = images[:, :, 2]
+        gray = 0.299 * r + 0.587 * g + 0.114 * b
+        return gray.unsqueeze(2)
+
     def _process_batch(self, events, images):
         """Process single batch:  teacher forward, student forward, compute loss."""
         B, T, C_ev, H_ev, W_ev = events.shape
@@ -349,7 +373,11 @@ class DistillationTrainer:
         # 2 Student Forward (with projector applied)
         # For evencoder-v1, use_projector=True; for evencoder-v2, projector is integrated
         if self.args.evencoder_type == "evencoder-v1":
-            student_output, _ = self.student(events, use_projector=True)
+            student_output, _, student_recon = self.student(
+                events,
+                use_projector=True,
+                return_recon=self.args.recon_loss
+            )
             # evencoder-v1 output: [B, T, C_out, H_enc, W_enc]
             _, _, C_out, H_enc, W_enc = student_output.shape
             student_proj = student_output.view(B_T, C_out, H_enc, W_enc)
@@ -357,10 +385,25 @@ class DistillationTrainer:
             B_T_check, Embed_dim, H_enc, W_enc = student_proj.shape
             student_tokens = student_proj.view(B_T_check, Embed_dim, H_enc * W_enc)
             student_tokens = student_tokens.transpose(1, 2)
-        else:  # evencoder-v2
-            student_output, _ = self.student(events)
-            # evencoder-v2 output: [B, T, N_patches, DINO_Dim] - already in token format
-            student_tokens = student_output.view(B_T, student_output.shape[2], student_output.shape[3])
+        elif self.args.evencoder_type == "evencoder-v2":
+            if self.args.recon_loss:
+                student_output, student_recon, _ = self.student(events, return_recon=True)
+                student_tokens = student_output.view(B_T, student_output.shape[2], student_output.shape[3])
+            else:
+                student_output, _, _ = self.student(events, return_recon=False)
+                # evencoder-v2 output: [B, T, N_patches, DINO_Dim] - already in token format
+                student_tokens = student_output.view(B_T, student_output.shape[2], student_output.shape[3])
+        else:  # evencoder-v3
+            student_output, student_recon = self.student(
+                events,
+                use_projector=True,
+                return_recon=self.args.recon_loss,
+            )
+            _, _, C_out, H_enc, W_enc = student_output.shape
+            student_proj = student_output.view(B_T, C_out, H_enc, W_enc)
+            B_T_check, Embed_dim, H_enc, W_enc = student_proj.shape
+            student_tokens = student_proj.view(B_T_check, Embed_dim, H_enc * W_enc)
+            student_tokens = student_tokens.transpose(1, 2)
         
         N_teacher = teacher_tokens.shape[1]
         N_student = student_tokens.shape[1]
@@ -376,9 +419,30 @@ class DistillationTrainer:
             student_tokens = student_tokens_temp.transpose(1, 2)
         
         # 6 Compute Loss in Token Space
-        loss = self.criterion(student_feat=student_tokens, teacher_feat=teacher_tokens)
+        distill_loss = self.criterion(student_feat=student_tokens, teacher_feat=teacher_tokens)
+        total_loss = distill_loss
+        perceptual_loss = None
+
+        if self.args.recon_loss and student_recon is not None:
+            gray_target = self._rgb_to_gray(images)
+            gray_target = gray_target.view(B_T, 1, H_img, W_img)
+            pred_recon = student_recon.view(
+                B_T,
+                student_recon.shape[2],
+                student_recon.shape[3],
+                student_recon.shape[4],
+            )
+            if pred_recon.shape[-2:] != (H_img, W_img):
+                pred_recon = F.interpolate(
+                    pred_recon,
+                    size=(H_img, W_img),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            perceptual_loss = self.perceptual_loss(pred_recon, gray_target)
+            total_loss = total_loss + self.args.recon_weight * perceptual_loss
         
-        return loss
+        return total_loss, distill_loss, perceptual_loss
 
     def train_epoch(self, dataloader, epoch_idx):
         """Train for one epoch."""
@@ -408,12 +472,12 @@ class DistillationTrainer:
             
             compute_start = time.time()
             
-            events = events.to(self.device, non_blocking=True)  # ✅ non_blocking
+            events = events.to(self.device, non_blocking=True)  
             images = images.to(self.device, non_blocking=True)
             
-            loss = self._process_batch(events, images)
+            loss, distill_loss, perceptual_loss = self._process_batch(events, images)
             
-            self.optimizer.zero_grad(set_to_none=True)  # ✅ 更彻底清理梯度
+            self.optimizer.zero_grad(set_to_none=True)  
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.student.parameters(),
@@ -421,8 +485,9 @@ class DistillationTrainer:
             )
             self.optimizer.step()
             
-            # ✅ 立即 detach loss
             loss_value = loss.detach().item()
+            distill_value = distill_loss.detach().item()
+            perceptual_value = perceptual_loss.detach().item() if perceptual_loss is not None else None
             epoch_loss += loss_value
             
             compute_time = time.time() - compute_start
@@ -439,16 +504,20 @@ class DistillationTrainer:
                 # ✅ Log to wandb with safe wrapper
                 if batch_idx % self.args.log_interval == 0:
                     global_step = (epoch_idx - 1) * len(dataloader) + batch_idx
-                    safe_wandb_log({
+                    log_data = {
                         'train/loss': loss_value,
+                        'train/distill_loss': distill_value,
                         'train/lr': self.scheduler.get_last_lr()[0],
                         'train/data_time': data_load_time,
                         'train/compute_time': compute_time,
                         'train/epoch': epoch_idx,
                         'train/step': global_step
-                    }, self.wandb_enabled)
+                    }
+                    if perceptual_value is not None:
+                        log_data['train/perceptual_loss'] = perceptual_value
+                    safe_wandb_log(log_data, self.wandb_enabled)
             
-            del events, images, loss
+            del events, images, loss, distill_loss, perceptual_loss
             if batch_idx % 50 == 0:
                 torch.cuda.empty_cache()
             
@@ -500,14 +569,13 @@ class DistillationTrainer:
                 events = events.to(self.device, non_blocking=True)
                 images = images.to(self.device, non_blocking=True)
                 
-                loss = self._process_batch(events, images)
+                loss, distill_loss, perceptual_loss = self._process_batch(events, images)
                 val_loss += loss.item()
                 
                 if self.is_main:
                     pbar.set_postfix({"Val Loss": f"{loss.item():.4f}"})
                 
-                # ✅ 显式删除
-                del events, images, loss
+                del events, images, loss, distill_loss, perceptual_loss
                 
                 if batch_idx % 50 == 0:
                     torch.cuda.empty_cache()
@@ -605,7 +673,9 @@ def main():
     parser.add_argument("--dino_model", type=str, default="dinov2_vitl14_reg")
     parser.add_argument("--teacher_checkpoint_path", type=str, default=None)
     parser.add_argument("--event_voxel_bin_num", type=int, default=8)
-    parser.add_argument("--evencoder_type",type=str,choices=["evencoder-v1", "evencoder-v2"], default="evencoder-v1")
+    parser.add_argument("--evencoder_type",type=str,choices=["evencoder-v1", "evencoder-v2", "evencoder-v3"], default="evencoder-v1")
+    parser.add_argument("--recon_loss",action="store_true",default=False)
+    parser.add_argument("--recon_weight", type=float, default=1.0)
     # Wandb
     parser.add_argument("--no_wandb", action='store_true',
                         help="Disable wandb logging")
@@ -613,7 +683,8 @@ def main():
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--log_interval", type=int, default=10,
                         help="Log interval for wandb")
-    
+    parser.add_argument("--save_interval", type=int, default=5,
+                        help="Save interval for checkpoints")
     args = parser.parse_args()
     
     # Setup distributed training
@@ -691,8 +762,8 @@ def main():
                     epoch=epoch, loss=avg_val_loss
                 )
             
-            # Save every 5 epochs
-            if epoch % 5 == 0:
+            # Save every interval epochs
+            if epoch % args.save_interval == 0:
                 trainer.save_checkpoint(
                     os.path.join(args.save_dir, f"epoch_{epoch}.pth"),
                     epoch=epoch, loss=avg_val_loss

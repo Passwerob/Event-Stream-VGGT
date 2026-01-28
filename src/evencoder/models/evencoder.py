@@ -109,13 +109,23 @@ class EvEncodBlockBone(nn.Module):
         return out, h_curr
 
 class EvEncoder(nn.Module):
-    def __init__(self, in_channels=8, base_channels=64, out_channels=16, project_out_channels=None):
+    def __init__(
+        self,
+        in_channels=8,
+        base_channels=64,
+        out_channels=16,
+        project_out_channels=None,
+        enable_decoder=False,
+        recon_out_channels=1,
+    ):
         """
         Args:
             in_channels: Voxel Grid channels
             base_channels: Hidden Layer channels
             out_channels: Latent Feature channels
             project_out_channels: Optional output channels for projector (e.g., for distillation to teacher)
+            enable_decoder: Whether to build a decoder for grayscale reconstruction.
+            recon_out_channels: Output channels for reconstruction (default: 1 for grayscale).
         """
         super().__init__()
         
@@ -134,22 +144,43 @@ class EvEncoder(nn.Module):
             self.projector = FeatureProjector(out_channels, project_out_channels)
         else:
             self.projector = None
+
+        self.enable_decoder = enable_decoder
+        if self.enable_decoder:
+            self.decoder = nn.Sequential(
+                nn.Conv2d(base_channels * 4, base_channels * 2, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(base_channels // 2, recon_out_channels, kernel_size=3, padding=1),
+                nn.Sigmoid(),
+            )
+        else:
+            self.decoder = None
         
-    def forward(self, voxel_grid, hidden_states=None, use_projector=False):
+    def forward(self, voxel_grid, hidden_states=None, use_projector=False, return_recon=False):
         """
         Args:
             voxel_grid: [B, T, C_in, H, W]
             hidden_states: list of tensors
             use_projector: If True, apply projector to output (only if projector is initialized)
+            return_recon: If True and decoder is enabled, return grayscale reconstruction.
         Returns:
             z: [B, T, C_out, H/8, W/8] (or projected if use_projector=True)
             last_states: list of tensors
+            recon: [B, T, 1, H, W] if return_recon else None
         """
         B, T, C, H, W = voxel_grid.shape
         
         if hidden_states is None:
             hidden_states = [None, None, None]
         z_list = []
+        recon_list = []
         
         for t in range(T):
             x = voxel_grid[:, t] # [B, C, H, W]
@@ -163,12 +194,17 @@ class EvEncoder(nn.Module):
             # Apply projector if requested and available
             if use_projector and self.projector is not None:
                 z_t = self.projector(z_t)
+
+            if return_recon and self.decoder is not None:
+                recon_t = self.decoder(feat)
+                recon_list.append(recon_t)
             
             z_list.append(z_t)
             hidden_states = [h1, h2, h3]
             
         z = torch.stack(z_list, dim=1) # [B, T, C_out, H/8, W/8]
-        return z, hidden_states
+        recon = torch.stack(recon_list, dim=1) if recon_list else None
+        return z, hidden_states, recon
 
 
 if __name__ == "__main__":

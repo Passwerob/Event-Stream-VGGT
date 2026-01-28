@@ -239,3 +239,80 @@ torchrun --nproc_per_node=4 \
     --teacher_checkpoint_path ./ckpts/dinov2_stream_vggt.pt \
     --seq_len 8 \
     --num_workers 2 --evencoder_type evencoder-v2
+
+
+
+export CUDA_VISIBLE_DEVICES=1,2,3,0
+INSTANCE_NAME=20251226-0400-evencoder-v2-1e-5
+DATA_PATH=/data/fcr/data/rgv_interval
+OUTPUT_PATH=/data/fcr/data/rgv_interval_train_preprocessed
+torchrun --nproc_per_node=4 \
+    --master_port=29503 \
+    distill.py \
+    --data_path ${OUTPUT_PATH} \
+    --save_dir ./checkpoints/${INSTANCE_NAME} \
+    --batch_size 2 \
+    --epochs 50 \
+    --lr 1e-5 \
+    --wandb_project evencoder-distillation \
+    --wandb_run_name ${INSTANCE_NAME} \
+    --teacher_checkpoint_path ./ckpts/dinov2_stream_vggt.pt \
+    --seq_len 8 \
+    --num_workers 2 --evencoder_type evencoder-v2
+
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+INSTANCE_NAME=20251226-0405-evencoder-v2-1e-6
+DATA_PATH=/data/fcr/data/rgv_interval
+OUTPUT_PATH=/data/fcr/data/rgv_interval_train_preprocessed
+torchrun --nproc_per_node=4 \
+    --master_port=29502 \
+    distill.py \
+    --data_path ${OUTPUT_PATH} \
+    --save_dir ./checkpoints/${INSTANCE_NAME} \
+    --batch_size 2 \
+    --epochs 50 \
+    --lr 1e-6 \
+    --wandb_project evencoder-distillation \
+    --wandb_run_name ${INSTANCE_NAME} \
+    --teacher_checkpoint_path ./ckpts/dinov2_stream_vggt.pt \
+    --seq_len 8 \
+    --num_workers 2 --evencoder_type evencoder-v2
+
+
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+INSTANCE_NAME=20260105-2205-evencoder-v2-1e-4
+DATA_PATH=/data/fcr/data/rgv_interval
+OUTPUT_PATH=/data/fcr/data/rgv_interval_pass/raw_data
+torchrun --nproc_per_node=4 \
+    --master_port=29502 \
+    distill.py \
+    --data_path ${OUTPUT_PATH} \
+    --save_dir ./checkpoints/${INSTANCE_NAME} \
+    --batch_size 2 \
+    --epochs 50 \
+    --lr 1e-4 \
+    --wandb_project evencoder-distillation \
+    --wandb_run_name ${INSTANCE_NAME} \
+    --teacher_checkpoint_path ./ckpts/dinov2_stream_vggt.pt \
+    --seq_len 8 \
+    --num_workers 2 --evencoder_type evencoder-v2 
+
+conda activate StreamVGGT
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+INSTANCE_NAME=20260106-2110-evencoder-v2-1e-3
+DATA_PATH=/data/fcr/data/rgv_interval
+OUTPUT_PATH=/data/fcr/data/rgv_interval_pass/raw_data
+torchrun --nproc_per_node=4 \
+    --master_port=29502 \
+    distill.py \
+    --data_path ${OUTPUT_PATH} \
+    --save_dir ./checkpoints/${INSTANCE_NAME} \
+    --batch_size 2 \
+    --epochs 50 \
+    --lr 1e-3 \
+    --wandb_project evencoder-distillation \
+    --wandb_run_name ${INSTANCE_NAME} \
+    --teacher_checkpoint_path ./ckpts/dinov2_stream_vggt.pt \
+    --seq_len 8 \
+    --num_workers 2 --evencoder_type evencoder-v2  --save_interval 1
