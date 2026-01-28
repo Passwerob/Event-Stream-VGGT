@@ -78,6 +78,34 @@ class EvEncoderV2PatchEmbed(nn.Module):
         return encoder_out.reshape(B * S, P, D)
 
 
+class EvEncoderV3PatchEmbed(nn.Module):
+    """Wrap EvEncoder-v3 (E2VID) to match StreamVGGT patch token shape."""
+
+    def __init__(self, encoder: nn.Module, patch_size: int, embed_dim: int):
+        super().__init__()
+        self.encoder = encoder
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+
+    def forward(self, voxel: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            voxel: [B, C, H, W] event voxel grid for a single frame.
+        Returns:
+            tokens: [B, N_patches, embed_dim]
+        """
+        B, C, H, W = voxel.shape
+        encoder_out, _ = self.encoder(voxel.unsqueeze(1), use_projector=True)
+        feats = encoder_out[:, 0]  # [B, embed_dim, H', W']
+
+        grid_h = max(1, H // self.patch_size)
+        grid_w = max(1, W // self.patch_size)
+        feats = F.interpolate(feats, size=(grid_h, grid_w), mode="bilinear", align_corners=False)
+
+        tokens = feats.flatten(2).transpose(1, 2)
+        return tokens
+
+
 class Aggregator(nn.Module):
     """
     The Aggregator applies alternating-attention over input frames,
@@ -137,7 +165,7 @@ class Aggregator(nn.Module):
         super().__init__()
 
         self.patch_embed_type = patch_embed
-        self.use_evencoder = patch_embed in {"evencoder", "evencoder-v2"}
+        self.use_evencoder = patch_embed in {"evencoder", "evencoder-v2", "evencoder-v3"}
         self.use_evencoder_v2 = patch_embed == "evencoder-v2"
 
         self.__build_patch_embed__(
@@ -290,6 +318,29 @@ class Aggregator(nn.Module):
                 projector,
                 student_key=evencoder_student_key,
                 projector_key=evencoder_projector_key,
+            )
+        elif patch_embed == "evencoder-v3":
+            from evencoder.models.evencoder_e2vid import EvEncoderE2VID
+
+            encoder = EvEncoderE2VID(
+                in_channels=evencoder_in_channels,
+                out_channels=evencoder_out_channels,
+                project_out_channels=embed_dim,
+            )
+            encoder.requires_grad_(False)
+
+            self.patch_embed = EvEncoderV3PatchEmbed(
+                encoder=encoder,
+                patch_size=patch_size,
+                embed_dim=embed_dim,
+            )
+
+            self._load_evencoder_weights(
+                evencoder_ckpt_path,
+                encoder,
+                projector=None,
+                student_key=evencoder_student_key,
+                projector_key=None,
             )
         else:
             vit_models = {

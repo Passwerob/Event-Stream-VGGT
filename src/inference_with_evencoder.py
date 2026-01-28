@@ -58,7 +58,7 @@ class StreamVGGTInference:
             )
             ckpt = torch.load(checkpoint_path, map_location="cpu")
             ckpt = self._strip_patch_embed_keys_if_needed(ckpt)
-            model.load_state_dict(ckpt, strict=self.extractor not in ("evencoder", "evencoder-v2"))
+            model.load_state_dict(ckpt, strict=self.extractor not in ("evencoder", "evencoder-v2", "evencoder-v3"))
             del ckpt
         else:
             print("Local checkpoint not found, downloading from Hugging Face...")
@@ -77,7 +77,7 @@ class StreamVGGTInference:
             )
             ckpt = torch.load(path, map_location="cpu")
             ckpt = self._strip_patch_embed_keys_if_needed(ckpt)
-            model.load_state_dict(ckpt, strict=self.extractor not in ("evencoder", "evencoder-v2"))
+            model.load_state_dict(ckpt, strict=self.extractor not in ("evencoder", "evencoder-v2", "evencoder-v3"))
             del ckpt
         
         model.to(self.device)
