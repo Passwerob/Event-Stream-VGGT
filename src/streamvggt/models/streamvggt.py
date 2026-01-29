@@ -33,7 +33,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         super().__init__()
 
         self.extractor_type = extractor_type
-        if extractor_type in ("evencoder", "evencoder-v2"):
+        if extractor_type in ("evencoder", "evencoder-v2", "evencoder-v3"):
             agg_patch = extractor_type
         else:
             agg_patch = patch_embed

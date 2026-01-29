@@ -58,7 +58,7 @@ class StreamVGGTInference:
             )
             ckpt = torch.load(checkpoint_path, map_location="cpu")
             ckpt = self._strip_patch_embed_keys_if_needed(ckpt)
-            model.load_state_dict(ckpt, strict=self.extractor not in ("evencoder", "evencoder-v2"))
+            model.load_state_dict(ckpt, strict=self.extractor not in ("evencoder", "evencoder-v2", "evencoder-v3"))
             del ckpt
         else:
             print("Local checkpoint not found, downloading from Hugging Face...")
@@ -77,7 +77,7 @@ class StreamVGGTInference:
             )
             ckpt = torch.load(path, map_location="cpu")
             ckpt = self._strip_patch_embed_keys_if_needed(ckpt)
-            model.load_state_dict(ckpt, strict=self.extractor not in ("evencoder", "evencoder-v2"))
+            model.load_state_dict(ckpt, strict=self.extractor not in ("evencoder", "evencoder-v2", "evencoder-v3"))
             del ckpt
         
         model.to(self.device)
@@ -149,7 +149,7 @@ class StreamVGGTInference:
         elif "model" in state_dict and isinstance(state_dict["model"], dict):
             state_dict = state_dict["model"]
 
-        if self.extractor not in ("evencoder", "evencoder-v2"):
+        if self.extractor not in ("evencoder", "evencoder-v2", "evencoder-v3"):
             return state_dict
         filtered = {k: v for k, v in state_dict.items() if not k.startswith("aggregator.patch_embed")}
         dropped = len(state_dict) - len(filtered)
@@ -565,7 +565,7 @@ def main():
     parser.add_argument("--fps_interval", type=float, default=1.0, help="For video: extract one frame every N seconds")
     parser.add_argument("--conf_threshold", type=float, default=0.5, help="Confidence threshold for point cloud filtering (0-1)")
     parser.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
-    parser.add_argument("--extractor", type=str, default="dino", choices=["dino", "evencoder","evencoder-v2"],
+    parser.add_argument("--extractor", type=str, default="dino", choices=["dino", "evencoder", "evencoder-v2", "evencoder-v3"],
                         help="Feature extractor to use for patch tokens")
     parser.add_argument("--evencoder_checkpoint", type=str, default=None,
                         help="Path to EvEncoder checkpoint (expects keys 'student' and 'projector')")
