@@ -189,7 +189,17 @@ class DINOv2(nn.Module):
                         # Remove 'module.' prefix if present (handles DataParallel checkpoints)
                         new_key = key.replace('module.', '') if key.startswith('module.') else key
                         cleaned_state_dict[new_key] = value
-                    
+
+                    def _strip_prefix(prefix):
+                        if any(k.startswith(prefix) for k in cleaned_state_dict):
+                            return {k[len(prefix):]: v for k, v in cleaned_state_dict.items() if k.startswith(prefix)}
+                        return None
+
+                    for prefix in ("dino.backbone.", "backbone.", "dino."):
+                        stripped = _strip_prefix(prefix)
+                        if stripped:
+                            return stripped
+
                     return cleaned_state_dict
                     
                 except Exception as e:
