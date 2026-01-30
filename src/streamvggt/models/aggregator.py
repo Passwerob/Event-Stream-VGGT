@@ -283,7 +283,7 @@ class Aggregator(nn.Module):
 
             # Pass evencoder_ckpt_path to EvEncoder so DINOv2 can extract weights from it
             # This avoids downloading DINOv2 weights when they're already in the checkpoint
-            encoder = EvEncoder(in_channels=evencoder_in_channels, evencoder_checkpoint_path=evencoder_ckpt_path)
+            encoder = EvEncoder(in_channels=evencoder_in_channels, checkpoint_path=evencoder_ckpt_path)
             encoder.requires_grad_(False)
 
             self.patch_embed = EvEncoderV2PatchEmbed(encoder=encoder)

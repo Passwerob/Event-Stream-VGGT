@@ -15,7 +15,7 @@ import threading
 
 from models.dino import DINOv2Teacher
 from dataloader.data_loader import PairedEventImageDataset
-from utils.loss_utils import DistillationLoss, PerceptualLoss
+from utils.loss_utils import DistillationLoss, FeatureProjector
 
 
 def setup_distributed():
@@ -252,7 +252,7 @@ class DistillationTrainer:
         
         self._verify_teacher_dimensions()
         
-        # Initialize Student (Trainable) with projector integrated
+        # Initialize Student (Trainable)
         if self.is_main:
             print("Initializing Student:  EvEncoder with projector...")
         if args.evencoder_type == "evencoder-v1":
@@ -261,7 +261,6 @@ class DistillationTrainer:
                 in_channels=args.event_voxel_bin_num, 
                 out_channels=16,
                 project_out_channels=self.teacher_embed_dim,
-                enable_decoder=args.recon_loss
             ).to(self.device)
         
         elif args.evencoder_type == "evencoder-v2":
@@ -272,16 +271,15 @@ class DistillationTrainer:
                 dino_model=args.dino_model,
                 target_res=(392, 518),
                 checkpoint_path=args.teacher_checkpoint_path,
-                enable_decoder=args.recon_loss,
             ).to(self.device)
         elif args.evencoder_type == "evencoder-v3":
             from models.evencoder_e2vid import EvEncoderE2VID
             self.student = EvEncoderE2VID(
                 in_channels=args.event_voxel_bin_num,
                 out_channels=64,
-                project_out_channels=self.teacher_embed_dim,
-                enable_decoder=args.recon_loss,
+                project_out_channels=16,
             ).to(self.device)
+            self.student.v3_projector = FeatureProjector(16, self.teacher_embed_dim).to(self.device)
         else:
             raise ValueError(f"Invalid evencoder type: {args.evencoder_type}")
 
@@ -312,11 +310,7 @@ class DistillationTrainer:
         
         # Loss Function
         self.criterion = DistillationLoss().to(self.device)
-        self.perceptual_loss = PerceptualLoss().to(self.device) if args.recon_loss else None
 
-        self.rgb_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1).to(self.device)
-        self.rgb_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1).to(self.device)
-        
         self.wandb_enabled = safe_wandb_init(args, self.is_main)
         if self.wandb_enabled:
             try:
@@ -348,15 +342,6 @@ class DistillationTrainer:
                       f"grid={self.teacher_grid_size}x{self.teacher_grid_size}, "
                       f"embed_dim={self.teacher_embed_dim}")
 
-    def _rgb_to_gray(self, images):
-        images = images * self.rgb_std + self.rgb_mean
-        images = images.clamp(0.0, 1.0)
-        r = images[:, :, 0]
-        g = images[:, :, 1]
-        b = images[:, :, 2]
-        gray = 0.299 * r + 0.587 * g + 0.114 * b
-        return gray.unsqueeze(2)
-
     def _process_batch(self, events, images):
         """Process single batch:  teacher forward, student forward, compute loss."""
         B, T, C_ev, H_ev, W_ev = events.shape
@@ -373,10 +358,9 @@ class DistillationTrainer:
         # 2 Student Forward (with projector applied)
         # For evencoder-v1, use_projector=True; for evencoder-v2, projector is integrated
         if self.args.evencoder_type == "evencoder-v1":
-            student_output, _, student_recon = self.student(
+            student_output, _, _ = self.student(
                 events,
                 use_projector=True,
-                return_recon=self.args.recon_loss
             )
             # evencoder-v1 output: [B, T, C_out, H_enc, W_enc]
             _, _, C_out, H_enc, W_enc = student_output.shape
@@ -386,21 +370,17 @@ class DistillationTrainer:
             student_tokens = student_proj.view(B_T_check, Embed_dim, H_enc * W_enc)
             student_tokens = student_tokens.transpose(1, 2)
         elif self.args.evencoder_type == "evencoder-v2":
-            if self.args.recon_loss:
-                student_output, student_recon, _ = self.student(events, return_recon=True)
-                student_tokens = student_output.view(B_T, student_output.shape[2], student_output.shape[3])
-            else:
-                student_output, _, _ = self.student(events, return_recon=False)
-                # evencoder-v2 output: [B, T, N_patches, DINO_Dim] - already in token format
-                student_tokens = student_output.view(B_T, student_output.shape[2], student_output.shape[3])
+            student_output, _, _ = self.student(events)
+            # evencoder-v2 output: [B, T, N_patches, DINO_Dim] - already in token format
+            student_tokens = student_output.view(B_T, student_output.shape[2], student_output.shape[3])
         else:  # evencoder-v3
-            student_output, student_recon = self.student(
+            student_output, _ = self.student(
                 events,
                 use_projector=True,
-                return_recon=self.args.recon_loss,
             )
             _, _, C_out, H_enc, W_enc = student_output.shape
             student_proj = student_output.view(B_T, C_out, H_enc, W_enc)
+            student_proj = self.student_module.v3_projector(student_proj)
             B_T_check, Embed_dim, H_enc, W_enc = student_proj.shape
             student_tokens = student_proj.view(B_T_check, Embed_dim, H_enc * W_enc)
             student_tokens = student_tokens.transpose(1, 2)
@@ -421,28 +401,7 @@ class DistillationTrainer:
         # 6 Compute Loss in Token Space
         distill_loss = self.criterion(student_feat=student_tokens, teacher_feat=teacher_tokens)
         total_loss = distill_loss
-        perceptual_loss = None
-
-        if self.args.recon_loss and student_recon is not None:
-            gray_target = self._rgb_to_gray(images)
-            gray_target = gray_target.view(B_T, 1, H_img, W_img)
-            pred_recon = student_recon.view(
-                B_T,
-                student_recon.shape[2],
-                student_recon.shape[3],
-                student_recon.shape[4],
-            )
-            if pred_recon.shape[-2:] != (H_img, W_img):
-                pred_recon = F.interpolate(
-                    pred_recon,
-                    size=(H_img, W_img),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            perceptual_loss = self.perceptual_loss(pred_recon, gray_target)
-            total_loss = total_loss + self.args.recon_weight * perceptual_loss
-        
-        return total_loss, distill_loss, perceptual_loss
+        return total_loss, distill_loss, None
 
     def train_epoch(self, dataloader, epoch_idx):
         """Train for one epoch."""
@@ -487,7 +446,6 @@ class DistillationTrainer:
             
             loss_value = loss.detach().item()
             distill_value = distill_loss.detach().item()
-            perceptual_value = perceptual_loss.detach().item() if perceptual_loss is not None else None
             epoch_loss += loss_value
             
             compute_time = time.time() - compute_start
@@ -513,8 +471,6 @@ class DistillationTrainer:
                         'train/epoch': epoch_idx,
                         'train/step': global_step
                     }
-                    if perceptual_value is not None:
-                        log_data['train/perceptual_loss'] = perceptual_value
                     safe_wandb_log(log_data, self.wandb_enabled)
             
             del events, images, loss, distill_loss, perceptual_loss
@@ -674,8 +630,6 @@ def main():
     parser.add_argument("--teacher_checkpoint_path", type=str, default=None)
     parser.add_argument("--event_voxel_bin_num", type=int, default=8)
     parser.add_argument("--evencoder_type",type=str,choices=["evencoder-v1", "evencoder-v2", "evencoder-v3"], default="evencoder-v1")
-    parser.add_argument("--recon_loss",action="store_true",default=False)
-    parser.add_argument("--recon_weight", type=float, default=1.0)
     # Wandb
     parser.add_argument("--no_wandb", action='store_true',
                         help="Disable wandb logging")
