@@ -41,8 +41,16 @@ class StreamVGGTInference:
         self.evencoder_checkpoint = evencoder_checkpoint
         self.ev_in_channels = ev_in_channels
         self.ev_out_channels = ev_out_channels
+        if self.extractor == "evencoder-v3" and self.evencoder_checkpoint:
+            inferred = self._infer_ev_out_channels_from_checkpoint(self.evencoder_checkpoint)
+            if inferred is not None and inferred != self.ev_out_channels:
+                print(
+                    f"⚠️  Overriding ev_out_channels={self.ev_out_channels} with checkpoint value {inferred} "
+                    "to avoid shape mismatches."
+                )
+                self.ev_out_channels = inferred
         self.model = self._load_model(checkpoint_path)
-        
+
     def _load_model(self, checkpoint_path):
         """Load StreamVGGT model from checkpoint."""
         # Expand ~ to home directory
@@ -84,6 +92,25 @@ class StreamVGGTInference:
         model.eval()
         print(f"Model loaded on {self.device}")
         return model
+
+    @staticmethod
+    def _infer_ev_out_channels_from_checkpoint(ckpt_path: str):
+        resolved = os.path.expanduser(ckpt_path)
+        if not os.path.exists(resolved):
+            return None
+        try:
+            ckpt = torch.load(resolved, map_location="cpu", weights_only=False)
+        except Exception:
+            return None
+        if isinstance(ckpt, dict):
+            state = ckpt.get("student") or ckpt.get("state_dict") or ckpt.get("model") or ckpt
+        else:
+            state = ckpt
+        if isinstance(state, dict):
+            weight = state.get("out_proj.weight")
+            if hasattr(weight, "shape") and len(weight.shape) > 0:
+                return int(weight.shape[0])
+        return None
 
     def _resize_event_voxel(self, event_voxel, image_size=(392, 518)):
         """

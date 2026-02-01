@@ -259,7 +259,7 @@ class DistillationTrainer:
             from models.evencoder import EvEncoder
             self.student = EvEncoder(
                 in_channels=args.event_voxel_bin_num, 
-                out_channels=16,
+                out_channels=args.ev_out_channels,
                 project_out_channels=self.teacher_embed_dim,
                 enable_decoder=args.recon_loss
             ).to(self.device)
@@ -278,7 +278,7 @@ class DistillationTrainer:
             from models.evencoder_e2vid import EvEncoderE2VID
             self.student = EvEncoderE2VID(
                 in_channels=args.event_voxel_bin_num,
-                out_channels=64,
+                out_channels=args.ev_out_channels,
                 project_out_channels=self.teacher_embed_dim,
                 enable_decoder=args.recon_loss,
             ).to(self.device)
@@ -673,6 +673,8 @@ def main():
     parser.add_argument("--dino_model", type=str, default="dinov2_vitl14_reg")
     parser.add_argument("--teacher_checkpoint_path", type=str, default=None)
     parser.add_argument("--event_voxel_bin_num", type=int, default=8)
+    parser.add_argument("--ev_out_channels", type=int, default=16,
+                        help="EvEncoder output channels before projection (v1/v3)")
     parser.add_argument("--evencoder_type",type=str,choices=["evencoder-v1", "evencoder-v2", "evencoder-v3"], default="evencoder-v1")
     parser.add_argument("--recon_loss",action="store_true",default=False)
     parser.add_argument("--recon_weight", type=float, default=1.0)
