@@ -611,16 +611,40 @@ class Aggregator(nn.Module):
             student_state = ckpt
 
         if student_state is not None:
-            msg = encoder.load_state_dict(student_state, strict=False)
+            filtered_state = self._filter_state_dict_for_model(student_state, encoder, "EvEncoder")
+            msg = encoder.load_state_dict(filtered_state, strict=False)
             if msg.missing_keys or msg.unexpected_keys:
                 logger.info(f"EvEncoder load_state_dict info - missing: {len(msg.missing_keys)}, unexpected: {len(msg.unexpected_keys)}")
         else:
             logger.warning("No student weights found in EvEncoder checkpoint.")
 
         if projector is not None and projector_state is not None:
-            proj_msg = projector.load_state_dict(projector_state, strict=False)
+            filtered_proj_state = self._filter_state_dict_for_model(projector_state, projector, "Projector")
+            proj_msg = projector.load_state_dict(filtered_proj_state, strict=False)
             if proj_msg.missing_keys or proj_msg.unexpected_keys:
                 logger.info(f"Projector load_state_dict info - missing: {len(proj_msg.missing_keys)}, unexpected: {len(proj_msg.unexpected_keys)}")
+
+    @staticmethod
+    def _filter_state_dict_for_model(state_dict: dict, model: nn.Module, name: str) -> dict:
+        """Filter out mismatched checkpoint weights to avoid size mismatch errors."""
+        if not isinstance(state_dict, dict):
+            return state_dict
+
+        model_state = model.state_dict()
+        filtered = {}
+        skipped = []
+        for key, value in state_dict.items():
+            if key not in model_state:
+                continue
+            if hasattr(value, "shape") and value.shape != model_state[key].shape:
+                skipped.append((key, value.shape, model_state[key].shape))
+                continue
+            filtered[key] = value
+
+        if skipped:
+            for key, ckpt_shape, model_shape in skipped:
+                logger.info(f"{name} checkpoint shape mismatch, skipping {key}: {ckpt_shape} vs {model_shape}")
+        return filtered
 
 
 def slice_expand_and_flatten(token_tensor, B, S):
